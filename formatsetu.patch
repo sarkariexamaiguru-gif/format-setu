@@ -1,27 +1,31 @@
 diff --git a/app/build.gradle.kts b/app/build.gradle.kts
-index 9b2da32..0ebd3cd 100644
+index 9b2da32..08ed9f6 100644
 --- a/app/build.gradle.kts
 +++ b/app/build.gradle.kts
-@@ -181,2 +181,6 @@ dependencies {
+@@ -181,2 +181,8 @@ dependencies {
      implementation(files(ffmpegKitLocalAar))
 +    // yt-dlp + a bundled Python runtime, so pasted links can be downloaded on device.
 +    // The ffmpeg module lets yt-dlp merge separate video/audio streams and extract audio.
++    // On-device inference for the AI tools (background removal, and the models to come).
++    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.28.0")
 +    implementation("io.github.junkfood02.youtubedl-android:library:0.18.1")
 +    implementation("io.github.junkfood02.youtubedl-android:ffmpeg:0.18.1")
      if (smartExceptionCommonLocalJar.isFile && smartExceptionJavaLocalJar.isFile) {
 diff --git a/app/src/main/java/org/zenconverter/app/conversion/ConversionService.kt b/app/src/main/java/org/zenconverter/app/conversion/ConversionService.kt
-index 917e483..a2c22f3 100644
+index 917e483..8e91d68 100644
 --- a/app/src/main/java/org/zenconverter/app/conversion/ConversionService.kt
 +++ b/app/src/main/java/org/zenconverter/app/conversion/ConversionService.kt
-@@ -73,2 +73,7 @@ import com.tom_roush.pdfbox.multipdf.PDFMergerUtility
+@@ -73,2 +73,9 @@ import com.tom_roush.pdfbox.multipdf.PDFMergerUtility
  import com.tom_roush.pdfbox.pdmodel.PDDocument
 +import com.tom_roush.pdfbox.pdmodel.PDPage
 +import com.tom_roush.pdfbox.pdmodel.PDPageContentStream
 +import com.tom_roush.pdfbox.pdmodel.common.PDRectangle
 +import com.tom_roush.pdfbox.pdmodel.font.PDType1Font
 +import com.tom_roush.pdfbox.pdmodel.graphics.state.PDExtendedGraphicsState
++import org.zenconverter.app.model.OnnxBackgroundRemover
++import org.zenconverter.app.model.OnnxModelManager
  import com.tom_roush.pdfbox.pdmodel.PDResources
-@@ -1440,2 +1445,26 @@ class ConversionService : Service() {
+@@ -1440,2 +1447,26 @@ class ConversionService : Service() {
  
 +        when (TargetId.fromKey(input.targetFormat)) {
 +            TargetId.PdfRotate -> {
@@ -48,7 +52,7 @@ index 917e483..a2c22f3 100644
 +        }
 +
          when (input.pdfSecurityOptions.mode) {
-@@ -1657,2 +1686,206 @@ class ConversionService : Service() {
+@@ -1657,2 +1688,206 @@ class ConversionService : Service() {
  
 +    // --- Offline PDF tools: rotate, organise, page numbers, watermark, crop ---
 +
@@ -255,14 +259,14 @@ index 917e483..a2c22f3 100644
 +    }
 +
      private fun writePdfTextFile(
-@@ -1885,3 +2118,5 @@ class ConversionService : Service() {
+@@ -1885,3 +2120,5 @@ class ConversionService : Service() {
                          input.imageOptions.quality,
 -                        shouldUseWebpLossless(outputProfile, input.imageOptions)
 +                        shouldUseWebpLossless(outputProfile, input.imageOptions),
 +                        targetSizeBytes = input.imageOptions.targetSizeBytes,
 +                        edit = input.imageOptions.edit
                      )
-@@ -2226,8 +2461,11 @@ class ConversionService : Service() {
+@@ -2226,8 +2463,11 @@ class ConversionService : Service() {
              throwIfConversionCancelled()
 -            outputFile.outputStream().use { output ->
 -                if (!bitmapForOutput.compress(compressFormat, quality, output)) {
@@ -280,21 +284,21 @@ index 917e483..a2c22f3 100644
 +                edit = input.imageOptions.edit
 +            )
              throwIfConversionCancelled()
-@@ -2323,3 +2561,5 @@ class ConversionService : Service() {
+@@ -2323,3 +2563,5 @@ class ConversionService : Service() {
              requestedQuality = imageOptions.quality,
 -            useWebpLossless = shouldUseWebpLossless(outputProfile, imageOptions)
 +            useWebpLossless = shouldUseWebpLossless(outputProfile, imageOptions),
 +            targetSizeBytes = imageOptions.targetSizeBytes,
 +            edit = imageOptions.edit
          )
-@@ -2332,3 +2572,5 @@ class ConversionService : Service() {
+@@ -2332,3 +2574,5 @@ class ConversionService : Service() {
          requestedQuality: Int,
 -        useWebpLossless: Boolean = false
 +        useWebpLossless: Boolean = false,
 +        targetSizeBytes: Long? = null,
 +        edit: ImageEditOptions? = null
      ) {
-@@ -2345,8 +2587,11 @@ class ConversionService : Service() {
+@@ -2345,8 +2589,11 @@ class ConversionService : Service() {
              throwIfConversionCancelled()
 -            outputFile.outputStream().use { output ->
 -                if (!bitmapForOutput.compress(compressFormat, quality, output)) {
@@ -312,7 +316,7 @@ index 917e483..a2c22f3 100644
 +                edit = edit
 +            )
              throwIfConversionCancelled()
-@@ -2359,2 +2604,371 @@ class ConversionService : Service() {
+@@ -2359,2 +2606,377 @@ class ConversionService : Service() {
  
 +    /**
 +     * Writes [bitmap] to [outputFile], honouring an optional maximum output size.
@@ -438,6 +442,12 @@ index 917e483..a2c22f3 100644
 +        }
 +        if (edit.blur != ImageBlurMode.Off) replace(blurBitmap(current, blurRadiusFor(edit.blur)))
 +        if (edit.colorMode != ImageColorMode.Original) replace(applyImageColorMode(current, edit.colorMode))
++        if (edit.removeBackground) {
++            val spec = OnnxModelManager.firstDownloadedBackgroundModel(this)
++            if (spec != null) {
++                replace(OnnxBackgroundRemover.remove(this, current, spec))
++            }
++        }
 +        if (!edit.watermarkText.isNullOrBlank()) replace(watermarkBitmap(current, edit))
 +
 +        intermediates.forEach { if (it !== current && !it.isRecycled) it.recycle() }
@@ -684,17 +694,17 @@ index 917e483..a2c22f3 100644
 +    }
 +
      private fun writeIcoImageFile(
-@@ -4209,3 +4823,3 @@ class ConversionService : Service() {
+@@ -4209,3 +4831,3 @@ class ConversionService : Service() {
                  }
 -                input.videoOptions.videoBitrate?.let { bitrate ->
 +                effectiveVideoBitrate(input.videoOptions, totalDurationMs, includeAudio, videoAudioOptions)?.let { bitrate ->
                      add("-b:v")
-@@ -4882,3 +5496,3 @@ class ConversionService : Service() {
+@@ -4882,3 +5504,3 @@ class ConversionService : Service() {
              }
 -            input.videoOptions.videoBitrate?.let { bitrate ->
 +            effectiveVideoBitrate(input.videoOptions, durationMs, includeAudio, videoAudioOptions)?.let { bitrate ->
                  add("-b:v")
-@@ -4933,2 +5547,22 @@ class ConversionService : Service() {
+@@ -4933,2 +5555,22 @@ class ConversionService : Service() {
  
 +    private fun effectiveVideoBitrate(
 +        videoOptions: VideoExportOptions,
@@ -717,14 +727,14 @@ index 917e483..a2c22f3 100644
 +    }
 +
      private fun ffmpegVideoAudioOptionsFor(
-@@ -4963,3 +5597,5 @@ class ConversionService : Service() {
+@@ -4963,3 +5605,5 @@ class ConversionService : Service() {
              } else {
 -                audioOptions.audioBitrate?.let { bitrate ->
 +                val targetAudioBitrate = targetBitrateForSize(audioOptions.targetSizeBytes, durationMs)
 +                    ?.coerceAtLeast(MIN_TARGET_AUDIO_BITRATE_BPS)
 +                (targetAudioBitrate ?: audioOptions.audioBitrate)?.let { bitrate ->
                      add("-b:a")
-@@ -5415,2 +6051,14 @@ class ConversionService : Service() {
+@@ -5415,2 +6059,14 @@ class ConversionService : Service() {
              )
 +            "aac" -> FfmpegAudioProfile(
 +                codec = FFMPEG_AAC_ENCODER,
@@ -739,13 +749,13 @@ index 917e483..a2c22f3 100644
 +            )
 +            "m4r" -> ffmpegAacAudioProfile()
              else -> null
-@@ -7138,2 +7786,5 @@ class ConversionService : Service() {
+@@ -7138,2 +7794,5 @@ class ConversionService : Service() {
                      "opus" -> OutputProfile(extension = "opus", mimeType = MIME_TYPE_OPUS, kind = OutputMediaKind.Audio)
 +                    "aac" -> OutputProfile(extension = "aac", mimeType = MIME_TYPE_AAC, kind = OutputMediaKind.Audio)
 +                    "aiff" -> OutputProfile(extension = "aiff", mimeType = MIME_TYPE_AIFF, kind = OutputMediaKind.Audio)
 +                    "m4r" -> OutputProfile(extension = "m4r", mimeType = MIME_TYPE_M4R, kind = OutputMediaKind.Audio)
                      else -> null
-@@ -7176,3 +7827,8 @@ class ConversionService : Service() {
+@@ -7176,3 +7835,8 @@ class ConversionService : Service() {
                          TargetId.fromKey(input.targetFormat) == TargetId.PdfDecrypt ||
 -                        TargetId.fromKey(input.targetFormat) == TargetId.PdfCompress ->
 +                        TargetId.fromKey(input.targetFormat) == TargetId.PdfCompress ||
@@ -755,7 +765,7 @@ index 917e483..a2c22f3 100644
 +                        TargetId.fromKey(input.targetFormat) == TargetId.PdfWatermark ||
 +                        TargetId.fromKey(input.targetFormat) == TargetId.PdfCrop ->
                          OutputProfile(extension = "pdf", mimeType = MIME_TYPE_PDF, kind = OutputMediaKind.Document)
-@@ -7219,3 +7875,6 @@ class ConversionService : Service() {
+@@ -7219,3 +7883,6 @@ class ConversionService : Service() {
              normalized.contains("mp3") -> "mp3"
 -            normalized.contains("m4a") || normalized.contains("aac") -> "m4a"
 +            normalized.contains("m4a") -> "m4a"
@@ -763,18 +773,18 @@ index 917e483..a2c22f3 100644
 +            normalized.contains("aiff") || normalized.contains("aif") -> "aiff"
 +            normalized.contains("m4r") -> "m4r"
              normalized.contains("wav") -> "wav"
-@@ -7622,2 +8281,3 @@ class ConversionService : Service() {
+@@ -7622,2 +8289,3 @@ class ConversionService : Service() {
          private const val FFMPEG_OPUS_ENCODER = "libopus"
 +        private const val FFMPEG_PCM_S16BE_ENCODER = "pcm_s16be"
          private val OPUS_SUPPORTED_SAMPLE_RATES = setOf(48_000, 24_000, 16_000, 12_000, 8_000)
-@@ -7652,2 +8312,5 @@ class ConversionService : Service() {
+@@ -7652,2 +8320,5 @@ class ConversionService : Service() {
          private const val MIME_TYPE_M4A = "audio/mp4"
 +        private const val MIME_TYPE_AAC = "audio/aac"
 +        private const val MIME_TYPE_AIFF = "audio/aiff"
 +        private const val MIME_TYPE_M4R = "audio/mp4"
          private const val MIME_TYPE_WAV = "audio/wav"
 diff --git a/app/src/main/java/org/zenconverter/app/conversion/ConversionTaskStore.kt b/app/src/main/java/org/zenconverter/app/conversion/ConversionTaskStore.kt
-index bd42038..8491722 100644
+index bd42038..4e7421d 100644
 --- a/app/src/main/java/org/zenconverter/app/conversion/ConversionTaskStore.kt
 +++ b/app/src/main/java/org/zenconverter/app/conversion/ConversionTaskStore.kt
 @@ -130,3 +130,4 @@ data class VideoExportOptions(
@@ -808,7 +818,7 @@ index bd42038..8491722 100644
 +}
 +
  data class MediaTrimRange(
-@@ -281,2 +299,89 @@ enum class ImageSuperResolutionMode(val scale: Int) {
+@@ -281,2 +299,91 @@ enum class ImageSuperResolutionMode(val scale: Int) {
  
 +enum class ImageResizeMode {
 +    Off,
@@ -880,7 +890,8 @@ index bd42038..8491722 100644
 +    val watermarkText: String? = null,
 +    val watermarkPosition: Int = 8,
 +    val watermarkOpacity: Int = 60,
-+    val watermarkSizePercent: Int = 6
++    val watermarkSizePercent: Int = 6,
++    val removeBackground: Boolean = false
 +) {
 +    val hasEdits: Boolean
 +        get() = resizeMode != ImageResizeMode.Off ||
@@ -889,6 +900,7 @@ index bd42038..8491722 100644
 +            crop != ImageCropMode.Off ||
 +            colorMode != ImageColorMode.Original ||
 +            blur != ImageBlurMode.Off ||
++            removeBackground ||
 +            !watermarkText.isNullOrBlank()
 +
 +    companion object {
@@ -898,7 +910,7 @@ index bd42038..8491722 100644
 +}
 +
  data class ImageExportOptions(
-@@ -284,5 +389,34 @@ data class ImageExportOptions(
+@@ -284,5 +391,34 @@ data class ImageExportOptions(
      val webpLossless: Boolean = false,
 -    val superResolution: ImageSuperResolutionMode = ImageSuperResolutionMode.Off
 +    val superResolution: ImageSuperResolutionMode = ImageSuperResolutionMode.Off,
@@ -934,7 +946,7 @@ index bd42038..8491722 100644
 +}
 +
  data class PdfExportOptions(
-@@ -290,3 +424,4 @@ data class PdfExportOptions(
+@@ -290,3 +426,4 @@ data class PdfExportOptions(
      val renderQuality: PdfRenderQuality = PdfRenderQuality.Balanced,
 -    val compressionPreset: PdfCompressionPreset = PdfCompressionPreset.Balanced
 +    val compressionPreset: PdfCompressionPreset = PdfCompressionPreset.Balanced,
@@ -1145,6 +1157,257 @@ index 0000000..4290d18
 +}
 +
 +class LinkDownloadException(message: String) : Exception(message)
+diff --git a/app/src/main/java/org/zenconverter/app/model/OnnxModels.kt b/app/src/main/java/org/zenconverter/app/model/OnnxModels.kt
+new file mode 100644
+index 0000000..4691802
+--- /dev/null
++++ b/app/src/main/java/org/zenconverter/app/model/OnnxModels.kt
+@@ -0,0 +1,245 @@
++package org.zenconverter.app.model
++
++import android.content.Context
++import android.graphics.Bitmap
++import ai.onnxruntime.OnnxTensor
++import ai.onnxruntime.OrtEnvironment
++import ai.onnxruntime.OrtSession
++import java.io.File
++import java.io.FileOutputStream
++import java.net.HttpURLConnection
++import java.net.URL
++import java.nio.FloatBuffer
++import kotlin.math.max
++import kotlin.math.min
++
++/**
++ * A downloadable ONNX model.
++ *
++ * @param inputSize square side the model expects, in pixels
++ * @param removeBackground true when the model outputs a foreground mask (u2net family)
++ */
++data class OnnxModelSpec(
++    val id: String,
++    val displayName: String,
++    val note: String,
++    val url: String,
++    val sizeBytes: Long,
++    val inputSize: Int,
++    val removeBackground: Boolean = true
++)
++
++/**
++ * Catalogue and on-disk store for the ONNX AI models. Downloads land in the app's
++ * private files directory, so nothing needs a storage permission and nothing is
++ * shared with anyone.
++ */
++object OnnxModelManager {
++
++    val MODELS = listOf(
++        OnnxModelSpec(
++            id = "u2netp",
++            displayName = "u2netp",
++            note = "Background removal · small and fast",
++            url = "https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2netp.onnx",
++            sizeBytes = 4_574_861L,
++            inputSize = 320
++        ),
++        OnnxModelSpec(
++            id = "silueta",
++            displayName = "silueta",
++            note = "Background removal · sharper edges",
++            url = "https://github.com/danielgatis/rembg/releases/download/v0.0.0/silueta.onnx",
++            sizeBytes = 44_165_480L,
++            inputSize = 320
++        ),
++        OnnxModelSpec(
++            id = "u2net",
++            displayName = "u2net",
++            note = "Background removal · full quality",
++            url = "https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2net.onnx",
++            sizeBytes = 175_997_641L,
++            inputSize = 320
++        ),
++        OnnxModelSpec(
++            id = "isnet-general-use",
++            displayName = "isnet-general-use",
++            note = "Background removal · best general purpose",
++            url = "https://github.com/danielgatis/rembg/releases/download/v0.0.0/isnet-general-use.onnx",
++            sizeBytes = 179_857_984L,
++            inputSize = 1024
++        )
++    )
++
++    private const val DIR = "onnx-models"
++
++    fun modelFile(context: Context, spec: OnnxModelSpec): File =
++        File(File(context.filesDir, DIR).apply { mkdirs() }, "${spec.id}.onnx")
++
++    fun isDownloaded(context: Context, spec: OnnxModelSpec): Boolean {
++        val file = modelFile(context, spec)
++        return file.isFile && file.length() > 1024L * 1024L
++    }
++
++    /** The smallest downloaded background-removal model, or null if none is ready. */
++    fun firstDownloadedBackgroundModel(context: Context): OnnxModelSpec? =
++        MODELS.filter { it.removeBackground && isDownloaded(context, it) }
++            .minByOrNull { it.sizeBytes }
++
++    fun delete(context: Context, spec: OnnxModelSpec) {
++        runCatching { modelFile(context, spec).delete() }
++    }
++
++    fun download(
++        context: Context,
++        spec: OnnxModelSpec,
++        onProgress: (Float) -> Unit
++    ) {
++        val target = modelFile(context, spec)
++        val partial = File(target.parentFile, "${spec.id}.part")
++        partial.delete()
++        val connection = (URL(spec.url).openConnection() as HttpURLConnection).apply {
++            connectTimeout = 20_000
++            readTimeout = 30_000
++            instanceFollowRedirects = true
++            setRequestProperty("User-Agent", "FormatSetu")
++        }
++        try {
++            connection.connect()
++            if (connection.responseCode !in 200..299) {
++                throw IllegalStateException("Server returned ${connection.responseCode}")
++            }
++            val total = if (connection.contentLengthLong > 0) {
++                connection.contentLengthLong
++            } else {
++                spec.sizeBytes
++            }
++            var copied = 0L
++            connection.inputStream.use { input ->
++                FileOutputStream(partial).use { output ->
++                    val buffer = ByteArray(256 * 1024)
++                    while (true) {
++                        val read = input.read(buffer)
++                        if (read <= 0) break
++                        output.write(buffer, 0, read)
++                        copied += read
++                        if (total > 0) onProgress((copied.toFloat() / total.toFloat()).coerceIn(0f, 1f))
++                    }
++                    output.flush()
++                }
++            }
++            if (partial.length() < 1024L * 1024L) {
++                throw IllegalStateException("The downloaded file looks incomplete.")
++            }
++            if (target.exists()) target.delete()
++            if (!partial.renameTo(target)) {
++                partial.copyTo(target, overwrite = true)
++                partial.delete()
++            }
++            onProgress(1f)
++        } finally {
++            partial.delete()
++            runCatching { connection.disconnect() }
++        }
++    }
++}
++
++/**
++ * Runs a u2net-family ONNX model over a bitmap and returns a cut-out copy with a
++ * transparent background. Everything happens on device.
++ */
++object OnnxBackgroundRemover {
++
++    fun remove(context: Context, source: Bitmap, spec: OnnxModelSpec): Bitmap {
++        val side = spec.inputSize
++        val scaled = Bitmap.createScaledBitmap(source, side, side, true)
++        val pixels = IntArray(side * side)
++        scaled.getPixels(pixels, 0, side, 0, 0, side, side)
++
++        // NCHW float input, ImageNet-normalised.
++        val buffer = FloatBuffer.allocate(3 * side * side)
++        val mean = floatArrayOf(0.485f, 0.456f, 0.406f)
++        val std = floatArrayOf(0.229f, 0.224f, 0.225f)
++        for (channel in 0 until 3) {
++            for (index in 0 until side * side) {
++                val pixel = pixels[index]
++                val value = when (channel) {
++                    0 -> ((pixel shr 16) and 0xFF) / 255f
++                    1 -> ((pixel shr 8) and 0xFF) / 255f
++                    else -> (pixel and 0xFF) / 255f
++                }
++                buffer.put(index, (value - mean[channel]) / std[channel])
++            }
++        }
++        if (scaled !== source) scaled.recycle()
++
++        val environment = OrtEnvironment.getEnvironment()
++        val options = OrtSession.SessionOptions().apply {
++            setIntraOpNumThreads(2)
++            setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
++        }
++        val session = environment.createSession(
++            OnnxModelManager.modelFile(context, spec).absolutePath,
++            options
++        )
++        try {
++            val inputName = session.inputNames.first()
++            val tensor = OnnxTensor.createTensor(
++                environment,
++                buffer,
++                longArrayOf(1, 3, side.toLong(), side.toLong())
++            )
++            val mask = FloatArray(side * side)
++            try {
++                session.run(mapOf(inputName to tensor)).use { result ->
++                    val output = result[0] as OnnxTensor
++                    val shape = output.info.shape
++                    val height = shape[2].toInt()
++                    val width = shape[3].toInt()
++                    val raw = output.floatBuffer
++                    val values = FloatArray(height * width)
++                    raw.get(values)
++                    // Normalise the mask to 0..1 whatever scale the model emits.
++                    var low = Float.MAX_VALUE
++                    var high = -Float.MAX_VALUE
++                    for (value in values) {
++                        if (value < low) low = value
++                        if (value > high) high = value
++                    }
++                    val range = max(high - low, 1e-6f)
++                    for (index in 0 until min(values.size, mask.size)) {
++                        mask[index] = ((values[index] - low) / range).coerceIn(0f, 1f)
++                    }
++                }
++            } finally {
++                tensor.close()
++            }
++
++            val maskBitmap = Bitmap.createBitmap(side, side, Bitmap.Config.ARGB_8888)
++            val maskPixels = IntArray(side * side)
++            for (index in maskPixels.indices) {
++                val alpha = (mask[index].coerceIn(0f, 1f) * 255f).toInt()
++                maskPixels[index] = alpha shl 24 or 0x00FFFFFF
++            }
++            maskBitmap.setPixels(maskPixels, 0, side, 0, 0, side, side)
++            val fullMask = Bitmap.createScaledBitmap(maskBitmap, source.width, source.height, true)
++            maskBitmap.recycle()
++
++            val output = source.copy(Bitmap.Config.ARGB_8888, true) ?: return source
++            val outPixels = IntArray(source.width * source.height)
++            val maskFull = IntArray(source.width * source.height)
++            output.getPixels(outPixels, 0, source.width, 0, 0, source.width, source.height)
++            fullMask.getPixels(maskFull, 0, source.width, 0, 0, source.width, source.height)
++            fullMask.recycle()
++            for (index in outPixels.indices) {
++                val alpha = (maskFull[index] ushr 24) and 0xFF
++                outPixels[index] = (alpha shl 24) or (outPixels[index] and 0x00FFFFFF)
++            }
++            output.setPixels(outPixels, 0, source.width, 0, 0, source.width, source.height)
++            return output
++        } finally {
++            runCatching { session.close() }
++            runCatching { options.close() }
++        }
++    }
++}
 diff --git a/app/src/main/java/org/zenconverter/app/ui/UiText.kt b/app/src/main/java/org/zenconverter/app/ui/UiText.kt
 index 23f94f9..a8d50db 100644
 --- a/app/src/main/java/org/zenconverter/app/ui/UiText.kt
@@ -1160,7 +1423,7 @@ index 23f94f9..a8d50db 100644
 +
      val pageSize: String
 diff --git a/app/src/main/java/org/zenconverter/app/ui/ZenConverterApp.kt b/app/src/main/java/org/zenconverter/app/ui/ZenConverterApp.kt
-index 49da19f..56aa07e 100644
+index 49da19f..b602272 100644
 --- a/app/src/main/java/org/zenconverter/app/ui/ZenConverterApp.kt
 +++ b/app/src/main/java/org/zenconverter/app/ui/ZenConverterApp.kt
 @@ -86,2 +86,3 @@ import androidx.compose.material.icons.rounded.Add
@@ -1173,23 +1436,24 @@ index 49da19f..56aa07e 100644
 +import androidx.compose.material3.Typography
 +import androidx.compose.material3.Slider
  import androidx.compose.material3.SliderColors
-@@ -139,2 +143,7 @@ import androidx.compose.runtime.getValue
+@@ -139,2 +143,8 @@ import androidx.compose.runtime.getValue
  import androidx.compose.runtime.mutableStateOf
 +import kotlinx.coroutines.Dispatchers
 +import kotlinx.coroutines.launch
 +import kotlinx.coroutines.withContext
 +import org.zenconverter.app.download.LinkDownloader
 +import org.zenconverter.app.download.LinkQuality
++import org.zenconverter.app.model.OnnxModelManager
  import androidx.compose.runtime.remember
-@@ -151,2 +160,3 @@ import androidx.compose.ui.geometry.Offset
+@@ -151,2 +161,3 @@ import androidx.compose.ui.geometry.Offset
  import androidx.compose.ui.geometry.Size
 +import androidx.compose.ui.graphics.Brush
  import androidx.compose.ui.graphics.Color
-@@ -180,2 +190,3 @@ import androidx.compose.ui.text.style.TextOverflow
+@@ -180,2 +191,3 @@ import androidx.compose.ui.text.style.TextOverflow
  import androidx.compose.ui.unit.dp
 +import androidx.compose.ui.unit.sp
  import androidx.compose.ui.unit.Dp
-@@ -190,3 +201,11 @@ import org.zenconverter.app.conversion.FileBasicInfo
+@@ -190,3 +202,11 @@ import org.zenconverter.app.conversion.FileBasicInfo
  import org.zenconverter.app.conversion.GifFrameExportMode
 +import org.zenconverter.app.conversion.ImageBlurMode
 +import org.zenconverter.app.conversion.ImageColorMode
@@ -1201,13 +1465,13 @@ index 49da19f..56aa07e 100644
 +import org.zenconverter.app.conversion.ImageRotateMode
 +import org.zenconverter.app.conversion.ImageSizeUnit
  import org.zenconverter.app.conversion.ImageSuperResolutionMode
-@@ -199,3 +218,5 @@ import org.zenconverter.app.conversion.PdfImagePageMode
+@@ -199,3 +219,5 @@ import org.zenconverter.app.conversion.PdfImagePageMode
  import org.zenconverter.app.conversion.PdfRenderQuality
 +import org.zenconverter.app.conversion.PdfPageNumberPosition
  import org.zenconverter.app.conversion.PdfSecurityOptions
 +import org.zenconverter.app.conversion.PdfToolOptions
  import org.zenconverter.app.conversion.VideoAdvancedOptions
-@@ -272,3 +293,6 @@ enum class FileCategory(
+@@ -272,3 +294,6 @@ enum class FileCategory(
              TargetFormat(TargetId.Wma, "wma", "Re-encode"),
 -            TargetFormat(TargetId.Opus, "opus", "Re-encode")
 +            TargetFormat(TargetId.Opus, "opus", "Re-encode"),
@@ -1215,7 +1479,7 @@ index 49da19f..56aa07e 100644
 +            TargetFormat(TargetId.Aiff, "aiff", "Uncompressed"),
 +            TargetFormat(TargetId.M4r, "m4r", "iPhone ringtone")
          )
-@@ -307,3 +331,8 @@ enum class FileCategory(
+@@ -307,3 +332,8 @@ enum class FileCategory(
              TargetFormat(TargetId.PdfEncrypt, "pdf", "Password protect"),
 -            TargetFormat(TargetId.PdfDecrypt, "pdf", "Remove password")
 +            TargetFormat(TargetId.PdfDecrypt, "pdf", "Remove password"),
@@ -1225,12 +1489,12 @@ index 49da19f..56aa07e 100644
 +            TargetFormat(TargetId.PdfWatermark, "pdf", "Stamp a watermark"),
 +            TargetFormat(TargetId.PdfCrop, "pdf", "Trim margins")
          )
-@@ -473,2 +502,4 @@ internal enum class AppScreen {
+@@ -473,2 +503,4 @@ internal enum class AppScreen {
      Home,
 +    AiStudio,
 +    Tools,
      Settings,
-@@ -508,12 +539,12 @@ internal enum class AccentColorOption(
+@@ -508,12 +540,12 @@ internal enum class AccentColorOption(
      Dynamic("Material You", Color(0xFF6750A4), Color.White, Color(0xFFD0BCFF), Color(0xFF381E72)),
 -    Charcoal("Charcoal", Color(0xFF111111), Color.White, Color(0xFFE5E7EB), Color(0xFF111111)),
 -    DeepNavy("Deep Navy", Color(0xFF36454F), Color.White, Color(0xFF93C5FD), Color(0xFF0F172A)),
@@ -1253,7 +1517,7 @@ index 49da19f..56aa07e 100644
 +    FernGreen("Fern Green", Color(0xFF4E8C6A), Color(0xFFFAF9F5), Color(0xFF8FD3B0), Color(0xFF0A2117)),
 +    DeepPurple("Deep Purple", Color(0xFF7C5CE0), Color(0xFFFFFDF8), Color(0xFFB9A6F2), Color(0xFF1C1233));
  
-@@ -965,3 +996,7 @@ fun ZenConverterApp(
+@@ -965,3 +997,7 @@ fun ZenConverterApp(
      ) {
 -        MaterialTheme(colorScheme = zenConverterColorScheme(context, accent, isDark, isOled)) {
 +        MaterialTheme(
@@ -1262,11 +1526,11 @@ index 49da19f..56aa07e 100644
 +            shapes = zenConverterShapes()
 +        ) {
              Surface(
-@@ -1145,2 +1180,3 @@ private fun ZenConverterContent(
+@@ -1145,2 +1181,3 @@ private fun ZenConverterContent(
      var showImportSourceSheet by rememberSaveable { mutableStateOf(false) }
 +    var showLinkDialog by rememberSaveable { mutableStateOf(false) }
      var showAlbumSourceDialog by rememberSaveable { mutableStateOf(false) }
-@@ -1197,2 +1233,13 @@ private fun ZenConverterContent(
+@@ -1197,2 +1234,13 @@ private fun ZenConverterContent(
                      contentWindowInsets = WindowInsets.safeDrawing,
 +                    bottomBar = {
 +                        FormatSetuBottomBar(
@@ -1280,14 +1544,14 @@ index 49da19f..56aa07e 100644
 +                        )
 +                    },
                      modifier = Modifier.fillMaxSize()
-@@ -1470,2 +1517,6 @@ private fun ZenConverterContent(
+@@ -1470,2 +1518,6 @@ private fun ZenConverterContent(
                          onPickFiles()
 +                    },
 +                    onOpenLink = {
 +                        showImportSourceSheet = false
 +                        showLinkDialog = true
                      }
-@@ -1474,2 +1525,9 @@ private fun ZenConverterContent(
+@@ -1474,2 +1526,9 @@ private fun ZenConverterContent(
  
 +            if (showLinkDialog) {
 +                LinkDownloadDialog(
@@ -1297,7 +1561,7 @@ index 49da19f..56aa07e 100644
 +            }
 +
              if (showAlbumSourceDialog) {
-@@ -1548,2 +1606,21 @@ private fun ZenConverterContent(
+@@ -1548,2 +1607,21 @@ private fun ZenConverterContent(
                  )
 +                AppScreen.AiStudio -> AiStudioScreen(
 +                    texts = texts,
@@ -1319,7 +1583,7 @@ index 49da19f..56aa07e 100644
 +                    onBack = { navigateBack() },
 +                )
                  AppScreen.Home -> Unit
-@@ -1554,2 +1631,387 @@ private fun ZenConverterContent(
+@@ -1554,2 +1632,471 @@ private fun ZenConverterContent(
  
 +@Composable
 +private fun FormatSetuBottomBar(
@@ -1389,6 +1653,12 @@ index 49da19f..56aa07e 100644
 +    onSelectTab: (AppScreen) -> Unit,
 +    onBack: () -> Unit
 +) {
++    val context = LocalContext.current
++    val scope = rememberCoroutineScope()
++    var onnxBusyId by remember { mutableStateOf<String?>(null) }
++    var onnxProgress by remember { mutableStateOf(0f) }
++    var onnxReload by remember { mutableStateOf(0) }
++
 +    Column(
 +        modifier = Modifier
 +            .fillMaxSize()
@@ -1451,8 +1721,86 @@ index 49da19f..56aa07e 100644
 +                )
 +            }
 +            Text(
-+                text = "Face swap, background removal, object removal and colourisation " +
-+                    "need extra ONNX models. They are next.",
++                text = "More models",
++                style = MaterialTheme.typography.titleMedium,
++                color = MaterialTheme.colorScheme.onBackground
++            )
++            OnnxModelManager.MODELS.forEach { spec ->
++                val downloaded = remember(spec.id, onnxReload) {
++                    OnnxModelManager.isDownloaded(context, spec)
++                }
++                val busy = onnxBusyId == spec.id
++                Row(
++                    modifier = Modifier
++                        .fillMaxWidth()
++                        .clip(RoundedCornerShape(14.dp))
++                        .background(MaterialTheme.colorScheme.surfaceContainer)
++                        .border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(14.dp))
++                        .padding(horizontal = 16.dp, vertical = 12.dp),
++                    verticalAlignment = Alignment.CenterVertically
++                ) {
++                    Column(modifier = Modifier.weight(1f)) {
++                        Text(
++                            text = spec.displayName,
++                            style = MaterialTheme.typography.bodyMedium,
++                            color = MaterialTheme.colorScheme.onSurface,
++                            maxLines = 1,
++                            overflow = TextOverflow.Ellipsis
++                        )
++                        Text(
++                            text = if (downloaded) {
++                                spec.note
++                            } else {
++                                "${formatBytes(spec.sizeBytes, texts)} · ${spec.note}"
++                            },
++                            style = MaterialTheme.typography.bodySmall,
++                            color = MaterialTheme.colorScheme.onSurfaceVariant,
++                            maxLines = 2,
++                            overflow = TextOverflow.Ellipsis
++                        )
++                    }
++                    when {
++                        busy -> Text(
++                            text = "${(onnxProgress * 100).toInt()}%",
++                            style = MaterialTheme.typography.labelLarge,
++                            color = MaterialTheme.colorScheme.primary
++                        )
++                        downloaded -> AppIcon(
++                            Icons.Rounded.Check,
++                            null,
++                            MaterialTheme.colorScheme.primary,
++                            Modifier.size(20.dp)
++                        )
++                        else -> Text(
++                            text = "Get",
++                            style = MaterialTheme.typography.labelLarge,
++                            color = MaterialTheme.colorScheme.onPrimary,
++                            modifier = Modifier
++                                .clip(RoundedCornerShape(10.dp))
++                                .background(MaterialTheme.colorScheme.primary)
++                                .clickable {
++                                    onnxBusyId = spec.id
++                                    onnxProgress = 0f
++                                    scope.launch {
++                                        runCatching {
++                                            withContext(Dispatchers.IO) {
++                                                OnnxModelManager.download(context, spec) { value ->
++                                                    onnxProgress = value
++                                                }
++                                            }
++                                        }
++                                        onnxBusyId = null
++                                        onnxReload += 1
++                                    }
++                                }
++                                .padding(horizontal = 14.dp, vertical = 6.dp)
++                        )
++                    }
++                }
++            }
++            Text(
++                text = "Turn on Remove background in any image's Adjust options to use these. " +
++                    "Face swap, object removal and colourisation are next.",
 +                style = MaterialTheme.typography.bodySmall,
 +                color = MaterialTheme.colorScheme.onSurfaceVariant
 +            )
@@ -1707,7 +2055,7 @@ index 49da19f..56aa07e 100644
 +}
 +
  @OptIn(ExperimentalFoundationApi::class)
-@@ -1836,2 +2298,148 @@ private fun ZenPromptActions(
+@@ -1836,2 +2383,148 @@ private fun ZenPromptActions(
  
 +private const val LINK_DOWNLOAD_PROCESS_ID = "format-setu-link"
 +
@@ -1856,23 +2204,23 @@ index 49da19f..56aa07e 100644
 +}
 +
  @Composable
-@@ -1867,3 +2475,3 @@ private fun Header(
+@@ -1867,3 +2560,3 @@ private fun Header(
                      .size(40.dp)
 -                    .clip(RoundedCornerShape(8.dp))
 +                    .clip(RoundedCornerShape(12.dp))
              )
-@@ -1877,3 +2485,3 @@ private fun Header(
+@@ -1877,3 +2570,3 @@ private fun Header(
                      style = MaterialTheme.typography.titleLarge,
 -                    fontWeight = FontWeight.SemiBold,
 +                    fontWeight = FontWeight.Medium,
                      color = MaterialTheme.colorScheme.onBackground,
-@@ -2637,3 +3245,4 @@ private fun ImportSourceSheet(
+@@ -2637,3 +3330,4 @@ private fun ImportSourceSheet(
      onPickFolder: () -> Unit,
 -    onPickFiles: () -> Unit
 +    onPickFiles: () -> Unit,
 +    onOpenLink: () -> Unit
  ) {
-@@ -2685,2 +3294,8 @@ private fun ImportSourceSheet(
+@@ -2685,2 +3379,8 @@ private fun ImportSourceSheet(
              )
 +            ImportSourceRow(
 +                icon = Icons.Rounded.Link,
@@ -1881,7 +2229,7 @@ index 49da19f..56aa07e 100644
 +                onClick = onOpenLink
 +            )
          }
-@@ -3104,2 +3719,16 @@ private fun BatchVideoTargetOptions(
+@@ -3104,2 +3804,16 @@ private fun BatchVideoTargetOptions(
      OptionGrid {
 +        TargetSizeField(
 +            valueBytes = commonBatchValue(files) { it.videoOptions.targetSizeBytes },
@@ -1898,7 +2246,7 @@ index 49da19f..56aa07e 100644
 +        )
 +
          if (!isGifTarget) {
-@@ -3379,2 +4008,16 @@ private fun BatchAudioTargetOptions(
+@@ -3379,2 +4093,16 @@ private fun BatchAudioTargetOptions(
      OptionGrid {
 +        TargetSizeField(
 +            valueBytes = commonBatchValue(files) { it.audioOptions.targetSizeBytes },
@@ -1915,7 +2263,7 @@ index 49da19f..56aa07e 100644
 +        )
 +
          if (isMp3Target(target)) {
-@@ -3529,2 +4172,9 @@ private fun BatchAudioTargetOptions(
+@@ -3529,2 +4257,9 @@ private fun BatchAudioTargetOptions(
  }
 +/** Shared value across a batch, or null when the files disagree. */
 +private fun <T> commonBatchValue(files: List<QueuedFile>, selector: (QueuedFile) -> T): T? {
@@ -1925,7 +2273,7 @@ index 49da19f..56aa07e 100644
 +}
 +
  @Composable
-@@ -3589,2 +4239,29 @@ private fun BatchImageTargetOptions(
+@@ -3589,2 +4324,29 @@ private fun BatchImageTargetOptions(
              )
 +        },
 +        qualityPercent = commonBatchValue(files) { it.imageOptions.quality } ?: 85,
@@ -1955,25 +2303,57 @@ index 49da19f..56aa07e 100644
 +                }
 +            )
          }
-@@ -5771,47 +6448,391 @@ private fun AdvancedOptionsPanel(
-             )
--    ) {
--        Row(
--            modifier = Modifier
--                .fillMaxWidth()
--                .clickable { onExpandedChange(!expanded) }
--                .padding(horizontal = 12.dp, vertical = 10.dp),
--            verticalAlignment = Alignment.CenterVertically
--        ) {
--            Column(
--                modifier = Modifier.weight(1f),
--                verticalArrangement = Arrangement.spacedBy(2.dp)
--            ) {
--                Text(
--                    text = title,
--                    style = MaterialTheme.typography.labelLarge,
--                    fontWeight = FontWeight.SemiBold,
--                    color = MaterialTheme.colorScheme.onSurface
+@@ -5734,84 +6496,434 @@ private fun AdvancedSwitchRow(
+         )
+-        Spacer(modifier = Modifier.width(12.dp))
+-        Switch(
+-            checked = checked,
+-            onCheckedChange = null,
+-            colors = SwitchDefaults.colors(
+-                checkedThumbColor = MaterialTheme.colorScheme.onPrimary,
+-                checkedTrackColor = MaterialTheme.colorScheme.primary,
+-                checkedBorderColor = MaterialTheme.colorScheme.primary,
+-                uncheckedThumbColor = MaterialTheme.colorScheme.onSurfaceVariant,
+-                uncheckedTrackColor = MaterialTheme.colorScheme.surfaceVariant,
+-                uncheckedBorderColor = MaterialTheme.colorScheme.outline
+-            )
++        Spacer(modifier = Modifier.width(12.dp))
++        Switch(
++            checked = checked,
++            onCheckedChange = null,
++            colors = SwitchDefaults.colors(
++                checkedThumbColor = MaterialTheme.colorScheme.onPrimary,
++                checkedTrackColor = MaterialTheme.colorScheme.primary,
++                checkedBorderColor = MaterialTheme.colorScheme.primary,
++                uncheckedThumbColor = MaterialTheme.colorScheme.onSurfaceVariant,
++                uncheckedTrackColor = MaterialTheme.colorScheme.surfaceVariant,
++                uncheckedBorderColor = MaterialTheme.colorScheme.outline
++            )
++        )
++    }
++}
++
++@Composable
++private fun AdvancedOptionsPanel(
++    title: String,
++    note: String,
++    expanded: Boolean,
++    onExpandedChange: (Boolean) -> Unit,
++    content: @Composable ColumnScope.() -> Unit
++) {
++    val arrowRotation by animateFloatAsState(
++        targetValue = if (expanded) 180f else 0f,
++        animationSpec = ZenAnimations.IconRotationSpring,
++        label = "advancedArrow"
++    )
++    Column(
++        modifier = Modifier
++            .fillMaxWidth()
++            .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.045f), RoundedCornerShape(8.dp))
++            .border(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.12f), RoundedCornerShape(8.dp))
++            .animateContentSize(
++                animationSpec = spring(stiffness = ZenAnimations.DropdownEnterStiffness)
++            )
 +    ) {
 +        Row(
 +            modifier = Modifier
@@ -2257,7 +2637,7 @@ index 49da19f..56aa07e 100644
 +                    label = "Height",
 +                    isError = false,
 +                    onValueChange = { onEditChange(edit.copy(resizeHeight = (it ?: 0.0).toFloat())) }
-                 )
++                )
 +                AdvancedSwitchRow(
 +                    label = "Keep aspect ratio",
 +                    checked = edit.keepAspect,
@@ -2326,12 +2706,59 @@ index 49da19f..56aa07e 100644
 +            onOpenMenuChange
 +        ) { value -> onEditChange(edit.copy(blur = imageBlurForLabel(value))) }
 +
++        AdvancedSwitchRow(
++            label = "Remove background",
++            checked = edit.removeBackground,
++            onCheckedChange = { onEditChange(edit.copy(removeBackground = it)) }
++        )
++
 +        OptionTextField(
 +            value = edit.watermarkText.orEmpty(),
 +            label = "Watermark text",
 +            onValueChange = { value -> onEditChange(edit.copy(watermarkText = value.ifBlank { null })) }
-+        )
-+
+         )
+-    }
+-}
+ 
+-@Composable
+-private fun AdvancedOptionsPanel(
+-    title: String,
+-    note: String,
+-    expanded: Boolean,
+-    onExpandedChange: (Boolean) -> Unit,
+-    content: @Composable ColumnScope.() -> Unit
+-) {
+-    val arrowRotation by animateFloatAsState(
+-        targetValue = if (expanded) 180f else 0f,
+-        animationSpec = ZenAnimations.IconRotationSpring,
+-        label = "advancedArrow"
+-    )
+-    Column(
+-        modifier = Modifier
+-            .fillMaxWidth()
+-            .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.045f), RoundedCornerShape(8.dp))
+-            .border(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.12f), RoundedCornerShape(8.dp))
+-            .animateContentSize(
+-                animationSpec = spring(stiffness = ZenAnimations.DropdownEnterStiffness)
+-            )
+-    ) {
+-        Row(
+-            modifier = Modifier
+-                .fillMaxWidth()
+-                .clickable { onExpandedChange(!expanded) }
+-                .padding(horizontal = 12.dp, vertical = 10.dp),
+-            verticalAlignment = Alignment.CenterVertically
+-        ) {
+-            Column(
+-                modifier = Modifier.weight(1f),
+-                verticalArrangement = Arrangement.spacedBy(2.dp)
+-            ) {
+-                Text(
+-                    text = title,
+-                    style = MaterialTheme.typography.labelLarge,
+-                    fontWeight = FontWeight.SemiBold,
+-                    color = MaterialTheme.colorScheme.onSurface
+-                )
 +        if (!edit.watermarkText.isNullOrBlank()) {
 +            OptionDropdown(
 +                "${menuPrefix}img-watermark-position",
@@ -2387,7 +2814,7 @@ index 49da19f..56aa07e 100644
 -                content = content
 -            )
          }
-@@ -5833,3 +6854,9 @@ private fun ImageOptions(
+@@ -5833,3 +6945,9 @@ private fun ImageOptions(
      onPdfPageModeChange: (String) -> Unit,
 -    onSuperResolutionChange: (String) -> Unit
 +    onSuperResolutionChange: (String) -> Unit,
@@ -2398,7 +2825,7 @@ index 49da19f..56aa07e 100644
 +    targetSizeBytes: Long? = null,
 +    onTargetSizeChange: (Long?) -> Unit = {}
  ) {
-@@ -5921,2 +6948,227 @@ private fun ImageOptions(
+@@ -5921,2 +7039,227 @@ private fun ImageOptions(
              )
 +            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
 +                Text(
@@ -2626,14 +3053,14 @@ index 49da19f..56aa07e 100644
 +
 +            else -> Unit
          }
-@@ -5935,3 +7187,5 @@ private fun PdfOptions(
+@@ -5935,3 +7278,5 @@ private fun PdfOptions(
      onRenderQualityChange: (String) -> Unit = {},
 -    onCompressionPresetChange: (String) -> Unit = {}
 +    onCompressionPresetChange: (String) -> Unit = {},
 +    pdfToolOptions: PdfToolOptions = PdfToolOptions(),
 +    onPdfToolOptionsChange: (PdfToolOptions) -> Unit = {}
  ) {
-@@ -5953,2 +7207,17 @@ private fun PdfOptions(
+@@ -5953,2 +7298,17 @@ private fun PdfOptions(
  
 +    if (isPdfToolTarget(targetFormat.id)) {
 +        OptionGrid {
@@ -2651,7 +3078,7 @@ index 49da19f..56aa07e 100644
 +    }
 +
      if (
-@@ -6092,17 +7361,15 @@ private fun QueueActions(
+@@ -6092,17 +7452,15 @@ private fun QueueActions(
          modifier = Modifier.fillMaxWidth(),
 -        horizontalArrangement = Arrangement.spacedBy(10.dp)
 +        verticalAlignment = Alignment.CenterVertically,
@@ -2681,7 +3108,7 @@ index 49da19f..56aa07e 100644
 +        )
 +        val startShape = RoundedCornerShape(28.dp)
          Button(
-@@ -6110,3 +7377,13 @@ private fun QueueActions(
+@@ -6110,3 +7468,13 @@ private fun QueueActions(
              enabled = !isRunning,
 -            modifier = Modifier.weight(1f)
 +            shape = startShape,
@@ -2696,18 +3123,18 @@ index 49da19f..56aa07e 100644
 +                .heightIn(min = 56.dp)
 +                .then(if (isRunning) Modifier else Modifier.background(SpectrumBrush, startShape))
          ) {
-@@ -6115,3 +7392,3 @@ private fun QueueActions(
+@@ -6115,3 +7483,3 @@ private fun QueueActions(
                  contentDescription = null,
 -                tint = MaterialTheme.colorScheme.onPrimary,
 +                tint = if (isRunning) MaterialTheme.colorScheme.onSurfaceVariant else SpectrumOnColor,
                  modifier = Modifier.size(18.dp)
-@@ -6380,3 +7657,4 @@ private fun QueuedFileOptionsPanel(
+@@ -6380,3 +7748,4 @@ private fun QueuedFileOptionsPanel(
          when (file.category) {
 -            FileCategory.Video -> VideoOptions(
 +            FileCategory.Video -> Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
 +            VideoOptions(
                  texts = texts,
-@@ -6569,3 +7847,13 @@ private fun QueuedFileOptionsPanel(
+@@ -6569,3 +7938,13 @@ private fun QueuedFileOptionsPanel(
              )
 -            FileCategory.Audio -> AudioOptions(
 +            TargetSizeField(
@@ -2722,7 +3149,7 @@ index 49da19f..56aa07e 100644
 +            FileCategory.Audio -> Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
 +            AudioOptions(
                  texts = texts,
-@@ -6645,3 +7933,12 @@ private fun QueuedFileOptionsPanel(
+@@ -6645,3 +8024,12 @@ private fun QueuedFileOptionsPanel(
              )
 -            FileCategory.Image -> {
 +            TargetSizeField(
@@ -2736,7 +3163,7 @@ index 49da19f..56aa07e 100644
 +            }
 +            FileCategory.Image -> Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                  ImageOptions(
-@@ -6657,3 +7954,15 @@ private fun QueuedFileOptionsPanel(
+@@ -6657,3 +8045,15 @@ private fun QueuedFileOptionsPanel(
                      onQualityChange = { value ->
 -                        onUpdateFile(file.copy(imageOptions = imageOptionsForQuality(value, selectedTarget.targetFormat)))
 +                        onUpdateFile(file.copy(imageOptions = imageOptionsForQuality(value, selectedTarget.targetFormat, file.imageOptions)))
@@ -2753,14 +3180,14 @@ index 49da19f..56aa07e 100644
 +                    onTargetSizeChange = { bytes ->
 +                        onUpdateFile(file.copy(imageOptions = file.imageOptions.copy(targetSizeBytes = bytes)))
                      },
-@@ -6706,2 +8015,6 @@ private fun QueuedFileOptionsPanel(
+@@ -6706,2 +8106,6 @@ private fun QueuedFileOptionsPanel(
                      onUpdateFile(file.copy(pdfOptions = file.pdfOptions.copy(compressionPreset = pdfCompressionPresetToOption(value))))
 +                },
 +                pdfToolOptions = file.pdfOptions.tool,
 +                onPdfToolOptionsChange = { tool ->
 +                    onUpdateFile(file.copy(pdfOptions = file.pdfOptions.copy(tool = tool)))
                  }
-@@ -6754,2 +8067,92 @@ private fun GifImageOptions(
+@@ -6754,2 +8158,92 @@ private fun GifImageOptions(
  
 +private const val TARGET_SIZE_KB = "KB"
 +private const val TARGET_SIZE_MB = "MB"
@@ -2853,7 +3280,7 @@ index 49da19f..56aa07e 100644
 +}
 +
  @Composable
-@@ -7060,2 +8463,37 @@ internal fun FileCategory.icon(): ImageVector {
+@@ -7060,2 +8554,37 @@ internal fun FileCategory.icon(): ImageVector {
  
 +// Sarvam's identity is a continuous blue-to-orange spectrum. We keep colour still
 +// everywhere except the single primary action, where the spectrum carries motion.
@@ -2891,7 +3318,7 @@ index 49da19f..56aa07e 100644
 +)
 +
  private fun zenConverterColorScheme(
-@@ -7094,2 +8532,12 @@ private fun zenConverterColorScheme(
+@@ -7094,2 +8623,12 @@ private fun zenConverterColorScheme(
  
 +    // Anthropic's canvas is warm paper, never pure white, and its ink is a warm
 +    // near-black. Those two decisions carry most of the brand.
@@ -2904,7 +3331,7 @@ index 49da19f..56aa07e 100644
 +    val warmText = Color(0xFFF5F3EC)
 +
      return if (!isDark) {
-@@ -7098,14 +8546,25 @@ private fun zenConverterColorScheme(
+@@ -7098,14 +8637,25 @@ private fun zenConverterColorScheme(
              onPrimary = onPrimary,
 +            primaryContainer = ivoryMedium,
 +            onPrimaryContainer = ink,
@@ -2940,7 +3367,7 @@ index 49da19f..56aa07e 100644
 +            error = Color(0xFF9E3B2F),
 +            onError = Color(0xFFFFF8F5)
          )
-@@ -7115,14 +8574,25 @@ private fun zenConverterColorScheme(
+@@ -7115,14 +8665,25 @@ private fun zenConverterColorScheme(
              onPrimary = onPrimary,
 +            primaryContainer = Color(0xFF2A2A26),
 +            onPrimaryContainer = warmText,
@@ -2974,7 +3401,7 @@ index 49da19f..56aa07e 100644
 +            error = Color(0xFFD98A7C),
 +            onError = Color(0xFF2A0C06)
          )
-@@ -7132,14 +8602,25 @@ private fun zenConverterColorScheme(
+@@ -7132,14 +8693,25 @@ private fun zenConverterColorScheme(
              onPrimary = onPrimary,
 +            primaryContainer = Color(0xFF3A3A34),
 +            onPrimaryContainer = warmText,
@@ -3010,13 +3437,13 @@ index 49da19f..56aa07e 100644
 +            error = Color(0xFFE0907F),
 +            onError = Color(0xFF2A0C06)
          )
-@@ -7608,3 +9089,4 @@ private fun imageOptionsForQuality(
+@@ -7608,3 +9180,4 @@ private fun imageOptionsForQuality(
      value: String,
 -    targetFormat: TargetFormat
 +    targetFormat: TargetFormat,
 +    current: ImageExportOptions? = null
  ): ImageExportOptions {
-@@ -7613,3 +9095,5 @@ private fun imageOptionsForQuality(
+@@ -7613,3 +9186,5 @@ private fun imageOptionsForQuality(
          webpLossless = supportsWebpLosslessQuality(targetFormat) &&
 -            value == IMAGE_QUALITY_LOSSLESS
 +            value == IMAGE_QUALITY_LOSSLESS,
