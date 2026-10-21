@@ -1,0 +1,2678 @@
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index 9b2da32..0ebd3cd 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -181,2 +181,6 @@ dependencies {
+     implementation(files(ffmpegKitLocalAar))
++    // yt-dlp + a bundled Python runtime, so pasted links can be downloaded on device.
++    // The ffmpeg module lets yt-dlp merge separate video/audio streams and extract audio.
++    implementation("io.github.junkfood02.youtubedl-android:library:0.18.1")
++    implementation("io.github.junkfood02.youtubedl-android:ffmpeg:0.18.1")
+     if (smartExceptionCommonLocalJar.isFile && smartExceptionJavaLocalJar.isFile) {
+diff --git a/app/src/main/java/org/zenconverter/app/conversion/ConversionService.kt b/app/src/main/java/org/zenconverter/app/conversion/ConversionService.kt
+index 917e483..a2c22f3 100644
+--- a/app/src/main/java/org/zenconverter/app/conversion/ConversionService.kt
++++ b/app/src/main/java/org/zenconverter/app/conversion/ConversionService.kt
+@@ -73,2 +73,7 @@ import com.tom_roush.pdfbox.multipdf.PDFMergerUtility
+ import com.tom_roush.pdfbox.pdmodel.PDDocument
++import com.tom_roush.pdfbox.pdmodel.PDPage
++import com.tom_roush.pdfbox.pdmodel.PDPageContentStream
++import com.tom_roush.pdfbox.pdmodel.common.PDRectangle
++import com.tom_roush.pdfbox.pdmodel.font.PDType1Font
++import com.tom_roush.pdfbox.pdmodel.graphics.state.PDExtendedGraphicsState
+ import com.tom_roush.pdfbox.pdmodel.PDResources
+@@ -1440,2 +1445,26 @@ class ConversionService : Service() {
+ 
++        when (TargetId.fromKey(input.targetFormat)) {
++            TargetId.PdfRotate -> {
++                writeRotatedPdf(input, outputFile)
++                return
++            }
++            TargetId.PdfOrganize -> {
++                writeOrganizedPdf(input, outputFile)
++                return
++            }
++            TargetId.PdfPageNumbers -> {
++                writePdfWithPageNumbers(input, outputFile)
++                return
++            }
++            TargetId.PdfWatermark -> {
++                writeWatermarkedPdf(input, outputFile)
++                return
++            }
++            TargetId.PdfCrop -> {
++                writeCroppedPdf(input, outputFile)
++                return
++            }
++            else -> Unit
++        }
++
+         when (input.pdfSecurityOptions.mode) {
+@@ -1657,2 +1686,206 @@ class ConversionService : Service() {
+ 
++    // --- Offline PDF tools: rotate, organise, page numbers, watermark, crop ---
++
++    /**
++     * Opens a single cached PDF, lets [process] mutate the document, then saves it.
++     * Every PDF tool shares this so load/save, cancellation and cleanup stay identical.
++     */
++    private fun forEachPdfPage(
++        input: ConversionTaskInput,
++        outputFile: File,
++        process: (PDDocument) -> Unit
++    ) {
++        val inputUris = input.inputUris.ifEmpty { listOf(input.inputUri) }
++        if (inputUris.size != 1) throw LocalizedFailure(localizedText(R.string.text_task_message_pdf_conversion_failed))
++
++        throwIfConversionCancelled()
++        ensurePdfBoxReady()
++        val cachedInputs = cachePdfInputsForPdfBox(input, inputUris)
++        val document = loadPdfBoxDocument(cachedInputs.files.first(), input.pdfPasswordAt(0))
++        try {
++            if (document.numberOfPages <= 0) {
++                throw LocalizedFailure(localizedText(R.string.text_task_message_pdf_has_no_pages))
++            }
++            throwIfConversionCancelled()
++            process(document)
++            throwIfConversionCancelled()
++            document.save(outputFile)
++            throwIfConversionCancelled()
++            updateImageProgress(0.95f)
++        } catch (throwable: Throwable) {
++            outputFile.delete()
++            throw throwable
++        } finally {
++            runCatching { document.close() }
++            cachedInputs.delete()
++        }
++    }
++
++    private fun writeRotatedPdf(input: ConversionTaskInput, outputFile: File) {
++        val degrees = input.pdfOptions.tool.rotateDegrees.coerceIn(0, 359)
++        forEachPdfPage(input, outputFile) { document ->
++            val pageCount = document.numberOfPages
++            for (pageIndex in 0 until pageCount) {
++                val page = document.getPage(pageIndex)
++                page.rotation = ((page.rotation + degrees) % 360 + 360) % 360
++                updateImageProgress(progressForIndexedWork(pageIndex, pageCount, 0.05f, 0.85f))
++            }
++        }
++    }
++
++    private fun writeOrganizedPdf(input: ConversionTaskInput, outputFile: File) {
++        val order = parsePdfPageOrder(input.pdfOptions.tool.pageOrder)
++        if (order.isEmpty()) throw LocalizedFailure(localizedText(R.string.text_task_message_pdf_conversion_failed))
++
++        val inputUris = input.inputUris.ifEmpty { listOf(input.inputUri) }
++        if (inputUris.size != 1) throw LocalizedFailure(localizedText(R.string.text_task_message_pdf_conversion_failed))
++
++        throwIfConversionCancelled()
++        ensurePdfBoxReady()
++        val cachedInputs = cachePdfInputsForPdfBox(input, inputUris)
++        val source = loadPdfBoxDocument(cachedInputs.files.first(), input.pdfPasswordAt(0))
++        val destination = PDDocument(MemoryUsageSetting.setupTempFileOnly())
++        try {
++            if (source.numberOfPages <= 0) {
++                throw LocalizedFailure(localizedText(R.string.text_task_message_pdf_has_no_pages))
++            }
++            order.forEachIndexed { index, pageNumber ->
++                throwIfConversionCancelled()
++                val pageIndex = pageNumber - 1
++                if (pageIndex in 0 until source.numberOfPages) {
++                    destination.importPage(source.getPage(pageIndex))
++                }
++                updateImageProgress(progressForIndexedWork(index, order.size, 0.05f, 0.85f))
++            }
++            if (destination.numberOfPages <= 0) {
++                throw LocalizedFailure(localizedText(R.string.text_task_message_pdf_conversion_failed))
++            }
++            throwIfConversionCancelled()
++            destination.save(outputFile)
++            throwIfConversionCancelled()
++            updateImageProgress(0.95f)
++        } catch (throwable: Throwable) {
++            outputFile.delete()
++            throw throwable
++        } finally {
++            runCatching { destination.close() }
++            runCatching { source.close() }
++            cachedInputs.delete()
++        }
++    }
++
++    /** Parses a 1-based page order such as "1,3,5-7" into page numbers. */
++    private fun parsePdfPageOrder(raw: String): List<Int> {
++        val trimmed = raw.trim().take(PdfToolOptions.MAX_PAGE_ORDER_LENGTH)
++        if (trimmed.isEmpty()) return emptyList()
++        val pages = mutableListOf<Int>()
++        trimmed.split(',').forEach { token ->
++            val part = token.trim()
++            if (part.isEmpty()) return@forEach
++            if (part.contains('-')) {
++                val bounds = part.split('-', limit = 2)
++                val start = bounds.getOrNull(0)?.trim()?.toIntOrNull()
++                val end = bounds.getOrNull(1)?.trim()?.toIntOrNull()
++                if (start != null && end != null) {
++                    if (start <= end) {
++                        for (page in start..end) pages.add(page)
++                    } else {
++                        for (page in start downTo end) pages.add(page)
++                    }
++                }
++            } else {
++                part.toIntOrNull()?.let { pages.add(it) }
++            }
++        }
++        return pages.filter { it > 0 }.take(PdfToolOptions.MAX_PAGE_ORDER_LENGTH)
++    }
++
++    private fun writePdfWithPageNumbers(input: ConversionTaskInput, outputFile: File) {
++        val tool = input.pdfOptions.tool
++        val startNumber = tool.pageNumberStart.coerceAtLeast(1)
++        forEachPdfPage(input, outputFile) { document ->
++            val font = PDType1Font.HELVETICA
++            val fontSize = 11f
++            val margin = 24f
++            val pageCount = document.numberOfPages
++            for (pageIndex in 0 until pageCount) {
++                val page = document.getPage(pageIndex)
++                val label = (startNumber + pageIndex).toString()
++                val box = page.cropBox
++                val textWidth = font.getStringWidth(label) / 1000f * fontSize
++                val x = when (tool.pageNumberPosition) {
++                    PdfPageNumberPosition.BottomLeft, PdfPageNumberPosition.TopLeft -> box.lowerLeftX + margin
++                    PdfPageNumberPosition.BottomRight, PdfPageNumberPosition.TopRight ->
++                        box.upperRightX - margin - textWidth
++                    else -> box.lowerLeftX + (box.width - textWidth) / 2f
++                }
++                val y = when (tool.pageNumberPosition) {
++                    PdfPageNumberPosition.TopLeft,
++                    PdfPageNumberPosition.TopCentre,
++                    PdfPageNumberPosition.TopRight -> box.upperRightY - margin
++                    else -> box.lowerLeftY + margin
++                }
++                PDPageContentStream(document, page, PDPageContentStream.AppendMode.APPEND, true, true).use { stream ->
++                    stream.beginText()
++                    stream.setFont(font, fontSize)
++                    stream.setNonStrokingColor(70, 70, 70)
++                    stream.setTextMatrix(com.tom_roush.pdfbox.util.Matrix.getTranslateInstance(x, y))
++                    stream.showText(label)
++                    stream.endText()
++                }
++                updateImageProgress(progressForIndexedWork(pageIndex, pageCount, 0.05f, 0.85f))
++            }
++        }
++    }
++
++    private fun writeWatermarkedPdf(input: ConversionTaskInput, outputFile: File) {
++        val tool = input.pdfOptions.tool
++        val text = tool.watermarkText?.trim().orEmpty()
++        if (text.isEmpty()) throw LocalizedFailure(localizedText(R.string.text_task_message_pdf_conversion_failed))
++        forEachPdfPage(input, outputFile) { document ->
++            val font = PDType1Font.HELVETICA_BOLD
++            val alpha = tool.watermarkOpacity.coerceIn(5, 100) / 100f
++            val angle = Math.toRadians(tool.watermarkRotation.coerceIn(0, 90).toDouble())
++            val pageCount = document.numberOfPages
++            for (pageIndex in 0 until pageCount) {
++                val page = document.getPage(pageIndex)
++                val box = page.cropBox
++                val fontSize = (minOf(box.width, box.height) * 0.12f).coerceIn(12f, 96f)
++                val textWidth = font.getStringWidth(text) / 1000f * fontSize
++                val state = PDExtendedGraphicsState().apply {
++                    nonStrokingAlphaConstant = alpha
++                }
++                PDPageContentStream(document, page, PDPageContentStream.AppendMode.APPEND, true, true).use { stream ->
++                    stream.setGraphicsStateParameters(state)
++                    stream.beginText()
++                    stream.setFont(font, fontSize)
++                    stream.setNonStrokingColor(120, 120, 120)
++                    val x = box.lowerLeftX + (box.width - (textWidth * Math.cos(angle).toFloat())) / 2f
++                    val y = box.lowerLeftY + (box.height - (textWidth * Math.sin(angle).toFloat())) / 2f
++                    stream.setTextMatrix(com.tom_roush.pdfbox.util.Matrix.getRotateInstance(angle, x, y))
++                    stream.showText(text)
++                    stream.endText()
++                }
++                updateImageProgress(progressForIndexedWork(pageIndex, pageCount, 0.05f, 0.85f))
++            }
++        }
++    }
++
++    private fun writeCroppedPdf(input: ConversionTaskInput, outputFile: File) {
++        val marginPercent = input.pdfOptions.tool.cropMarginPercent.coerceIn(0, 40)
++        forEachPdfPage(input, outputFile) { document ->
++            val pageCount = document.numberOfPages
++            for (pageIndex in 0 until pageCount) {
++                val page = document.getPage(pageIndex)
++                val box = page.cropBox
++                val insetX = box.width * marginPercent / 100f
++                val insetY = box.height * marginPercent / 100f
++                val newWidth = (box.width - insetX * 2f).coerceAtLeast(1f)
++                val newHeight = (box.height - insetY * 2f).coerceAtLeast(1f)
++                page.cropBox = PDRectangle(box.lowerLeftX + insetX, box.lowerLeftY + insetY, newWidth, newHeight)
++                updateImageProgress(progressForIndexedWork(pageIndex, pageCount, 0.05f, 0.85f))
++            }
++        }
++    }
++
+     private fun writePdfTextFile(
+@@ -1885,3 +2118,5 @@ class ConversionService : Service() {
+                         input.imageOptions.quality,
+-                        shouldUseWebpLossless(outputProfile, input.imageOptions)
++                        shouldUseWebpLossless(outputProfile, input.imageOptions),
++                        targetSizeBytes = input.imageOptions.targetSizeBytes,
++                        edit = input.imageOptions.edit
+                     )
+@@ -2226,8 +2461,11 @@ class ConversionService : Service() {
+             throwIfConversionCancelled()
+-            outputFile.outputStream().use { output ->
+-                if (!bitmapForOutput.compress(compressFormat, quality, output)) {
+-                    throw LocalizedFailure(localizedText(R.string.text_task_message_image_engine_could_not_write_this_output))
+-                }
+-                output.flush()
+-            }
++            writeCompressedImage(
++                bitmap = bitmapForOutput,
++                outputFile = outputFile,
++                compressFormat = compressFormat,
++                maxQuality = quality,
++                useWebpLossless = useWebpLossless,
++                targetSizeBytes = input.imageOptions.targetSizeBytes,
++                edit = input.imageOptions.edit
++            )
+             throwIfConversionCancelled()
+@@ -2323,3 +2561,5 @@ class ConversionService : Service() {
+             requestedQuality = imageOptions.quality,
+-            useWebpLossless = shouldUseWebpLossless(outputProfile, imageOptions)
++            useWebpLossless = shouldUseWebpLossless(outputProfile, imageOptions),
++            targetSizeBytes = imageOptions.targetSizeBytes,
++            edit = imageOptions.edit
+         )
+@@ -2332,3 +2572,5 @@ class ConversionService : Service() {
+         requestedQuality: Int,
+-        useWebpLossless: Boolean = false
++        useWebpLossless: Boolean = false,
++        targetSizeBytes: Long? = null,
++        edit: ImageEditOptions? = null
+     ) {
+@@ -2345,8 +2587,11 @@ class ConversionService : Service() {
+             throwIfConversionCancelled()
+-            outputFile.outputStream().use { output ->
+-                if (!bitmapForOutput.compress(compressFormat, quality, output)) {
+-                    throw LocalizedFailure(localizedText(R.string.text_task_message_image_engine_could_not_write_this_output))
+-                }
+-                output.flush()
+-            }
++            writeCompressedImage(
++                bitmap = bitmapForOutput,
++                outputFile = outputFile,
++                compressFormat = compressFormat,
++                maxQuality = quality,
++                useWebpLossless = useWebpLossless,
++                targetSizeBytes = targetSizeBytes,
++                edit = edit
++            )
+             throwIfConversionCancelled()
+@@ -2359,2 +2604,371 @@ class ConversionService : Service() {
+ 
++    /**
++     * Writes [bitmap] to [outputFile], honouring an optional maximum output size.
++     * Lossy formats search for the highest quality that fits; lossless formats
++     * progressively downscale until the encoded result fits.
++     */
++    private fun writeCompressedImage(
++        bitmap: Bitmap,
++        outputFile: File,
++        compressFormat: Bitmap.CompressFormat,
++        maxQuality: Int,
++        useWebpLossless: Boolean,
++        targetSizeBytes: Long?,
++        edit: ImageEditOptions? = null
++    ) {
++        val edited = if (edit != null) applyImageEdits(bitmap, edit) else bitmap
++        try {
++            writeCompressedImageInternal(edited, outputFile, compressFormat, maxQuality, useWebpLossless, targetSizeBytes)
++        } finally {
++            if (edited !== bitmap && !edited.isRecycled) edited.recycle()
++        }
++    }
++
++    private fun writeCompressedImageInternal(
++        bitmap: Bitmap,
++        outputFile: File,
++        compressFormat: Bitmap.CompressFormat,
++        maxQuality: Int,
++        useWebpLossless: Boolean,
++        targetSizeBytes: Long?
++    ) {
++        val isLossless = compressFormat == Bitmap.CompressFormat.PNG || useWebpLossless
++        if (targetSizeBytes == null || targetSizeBytes <= 0L) {
++            writeImageBytes(outputFile, compressBitmapToBytes(bitmap, compressFormat, maxQuality))
++            return
++        }
++        if (!isLossless) {
++            val cappedQuality = maxQuality.coerceIn(1, 100)
++            val bestEffort = compressBitmapToBytes(bitmap, compressFormat, cappedQuality)
++            if (bestEffort.size.toLong() <= targetSizeBytes) {
++                writeImageBytes(outputFile, bestEffort)
++                return
++            }
++            var low = 1
++            var high = cappedQuality - 1
++            var chosen: ByteArray? = null
++            while (low <= high) {
++                val mid = (low + high) / 2
++                val candidate = compressBitmapToBytes(bitmap, compressFormat, mid)
++                if (candidate.size.toLong() <= targetSizeBytes) {
++                    chosen = candidate
++                    low = mid + 1
++                } else {
++                    high = mid - 1
++                }
++            }
++            writeImageBytes(outputFile, chosen ?: compressBitmapToBytes(bitmap, compressFormat, 1))
++            return
++        }
++        var scale = 1.0
++        var bytes = compressBitmapToBytes(bitmap, compressFormat, 100)
++        var attempts = 0
++        while (bytes.size.toLong() > targetSizeBytes && scale > 0.2 && attempts < 12) {
++            scale *= 0.85
++            val scaledWidth = (bitmap.width * scale).toInt().coerceAtLeast(1)
++            val scaledHeight = (bitmap.height * scale).toInt().coerceAtLeast(1)
++            val scaled = Bitmap.createScaledBitmap(bitmap, scaledWidth, scaledHeight, true)
++            bytes = compressBitmapToBytes(scaled, compressFormat, 100)
++            scaled.recycle()
++            attempts += 1
++        }
++        writeImageBytes(outputFile, bytes)
++    }
++
++    private fun compressBitmapToBytes(
++        bitmap: Bitmap,
++        compressFormat: Bitmap.CompressFormat,
++        quality: Int
++    ): ByteArray {
++        return ByteArrayOutputStream().use { output ->
++            if (!bitmap.compress(compressFormat, quality.coerceIn(1, 100), output)) {
++                throw LocalizedFailure(localizedText(R.string.text_task_message_image_engine_could_not_write_this_output))
++            }
++            output.toByteArray()
++        }
++    }
++
++    private fun writeImageBytes(outputFile: File, bytes: ByteArray) {
++        outputFile.outputStream().use { output ->
++            output.write(bytes)
++            output.flush()
++        }
++    }
++
++    // --- Image edit pipeline: resize, crop, rotate, flip, colour, blur, watermark ---
++
++    private fun applyImageEdits(source: Bitmap, edit: ImageEditOptions): Bitmap {
++        if (!edit.hasEdits) return source
++        var current: Bitmap = source
++        val intermediates = mutableListOf<Bitmap>()
++
++        fun replace(next: Bitmap?) {
++            if (next == null || next === current) return
++            if (current !== source) intermediates.add(current)
++            current = next
++        }
++
++        if (edit.crop != ImageCropMode.Off) replace(cropBitmapForMode(current, edit.crop))
++        if (edit.rotate != ImageRotateMode.None) {
++            val matrix = Matrix().apply { postRotate(rotationDegreesFor(edit.rotate).toFloat()) }
++            replace(Bitmap.createBitmap(current, 0, 0, current.width, current.height, matrix, true))
++        }
++        if (edit.flip != ImageFlipMode.None) {
++            val matrix = Matrix().apply {
++                val flipX = edit.flip == ImageFlipMode.Horizontal || edit.flip == ImageFlipMode.Both
++                val flipY = edit.flip == ImageFlipMode.Vertical || edit.flip == ImageFlipMode.Both
++                postScale(if (flipX) -1f else 1f, if (flipY) -1f else 1f)
++            }
++            replace(Bitmap.createBitmap(current, 0, 0, current.width, current.height, matrix, true))
++        }
++        resizeTargetFor(current, edit)?.let { (targetWidth, targetHeight) ->
++            replace(Bitmap.createScaledBitmap(current, targetWidth, targetHeight, true))
++        }
++        if (edit.blur != ImageBlurMode.Off) replace(blurBitmap(current, blurRadiusFor(edit.blur)))
++        if (edit.colorMode != ImageColorMode.Original) replace(applyImageColorMode(current, edit.colorMode))
++        if (!edit.watermarkText.isNullOrBlank()) replace(watermarkBitmap(current, edit))
++
++        intermediates.forEach { if (it !== current && !it.isRecycled) it.recycle() }
++        return current
++    }
++
++    private fun rotationDegreesFor(mode: ImageRotateMode): Int = when (mode) {
++        ImageRotateMode.Clockwise90 -> 90
++        ImageRotateMode.Rotate180 -> 180
++        ImageRotateMode.CounterClockwise90 -> 270
++        ImageRotateMode.None -> 0
++    }
++
++    private fun blurRadiusFor(mode: ImageBlurMode): Int = when (mode) {
++        ImageBlurMode.Light -> 4
++        ImageBlurMode.Standard -> 10
++        ImageBlurMode.Heavy -> 20
++        ImageBlurMode.Off -> 0
++    }
++
++    private fun cropBitmapForMode(source: Bitmap, mode: ImageCropMode): Bitmap {
++        val width = source.width
++        val height = source.height
++        if (width <= 0 || height <= 0) return source
++        if (mode == ImageCropMode.Circle) {
++            val side = minOf(width, height)
++            val square = Bitmap.createBitmap(source, (width - side) / 2, (height - side) / 2, side, side)
++            return circleMaskedBitmap(square)
++        }
++        val ratio = when (mode) {
++            ImageCropMode.Square -> 1.0 to 1.0
++            ImageCropMode.FourThree -> 4.0 to 3.0
++            ImageCropMode.ThreeFour -> 3.0 to 4.0
++            ImageCropMode.SixteenNine -> 16.0 to 9.0
++            ImageCropMode.NineSixteen -> 9.0 to 16.0
++            else -> return source
++        }
++        val targetAspect = ratio.first / ratio.second
++        val currentAspect = width.toDouble() / height.toDouble()
++        val cropWidth: Int
++        val cropHeight: Int
++        if (currentAspect > targetAspect) {
++            cropHeight = height
++            cropWidth = (height * targetAspect).toInt()
++        } else {
++            cropWidth = width
++            cropHeight = (width / targetAspect).toInt()
++        }
++        val safeWidth = cropWidth.coerceIn(1, width)
++        val safeHeight = cropHeight.coerceIn(1, height)
++        return Bitmap.createBitmap(
++            source,
++            ((width - safeWidth) / 2).coerceAtLeast(0),
++            ((height - safeHeight) / 2).coerceAtLeast(0),
++            safeWidth,
++            safeHeight
++        )
++    }
++
++    private fun circleMaskedBitmap(source: Bitmap): Bitmap {
++        val size = minOf(source.width, source.height)
++        val output = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
++        val canvas = Canvas(output)
++        canvas.clipPath(Path().apply { addCircle(size / 2f, size / 2f, size / 2f, Path.Direction.CW) })
++        canvas.drawBitmap(source, -((source.width - size) / 2f), -((source.height - size) / 2f), Paint(Paint.ANTI_ALIAS_FLAG))
++        return output
++    }
++
++    private fun resizeTargetFor(source: Bitmap, edit: ImageEditOptions): Pair<Int, Int>? {
++        if (edit.resizeMode == ImageResizeMode.Off) return null
++        val sourceWidth = source.width
++        val sourceHeight = source.height
++        if (sourceWidth <= 0 || sourceHeight <= 0) return null
++        return when (edit.resizeMode) {
++            ImageResizeMode.Exact -> {
++                val requestedWidth = pixelCountFor(edit.resizeWidth, edit.sizeUnit, edit.dpi)
++                val requestedHeight = pixelCountFor(edit.resizeHeight, edit.sizeUnit, edit.dpi)
++                if (edit.keepAspect) {
++                    val scale = minOf(
++                        requestedWidth.toDouble() / sourceWidth.toDouble(),
++                        requestedHeight.toDouble() / sourceHeight.toDouble()
++                    )
++                    scaleSize(sourceWidth, sourceHeight, scale)
++                } else {
++                    requestedWidth to requestedHeight
++                }
++            }
++            ImageResizeMode.Percent ->
++                scaleSize(sourceWidth, sourceHeight, edit.resizeWidth.coerceIn(1f, 1000f).toDouble() / 100.0)
++            ImageResizeMode.FitLongSide -> {
++                val limit = pixelCountFor(edit.resizeWidth, edit.sizeUnit, edit.dpi)
++                val longSide = maxOf(sourceWidth, sourceHeight)
++                if (longSide <= limit) null
++                else scaleSize(sourceWidth, sourceHeight, limit.toDouble() / longSide.toDouble())
++            }
++            ImageResizeMode.Off -> null
++        }
++    }
++
++    private fun scaleSize(width: Int, height: Int, scale: Double): Pair<Int, Int> {
++        val safeScale = scale.coerceIn(0.01, 20.0)
++        return (width * safeScale).toInt().coerceIn(1, ImageEditOptions.MAX_RESIZE_PIXELS) to
++            (height * safeScale).toInt().coerceIn(1, ImageEditOptions.MAX_RESIZE_PIXELS)
++    }
++
++    private fun pixelCountFor(value: Float, unit: ImageSizeUnit, dpi: Int): Int {
++        val safeValue = value.coerceIn(0.01f, 10_000f)
++        val safeDpi = dpi.coerceIn(36, ImageEditOptions.MAX_DPI)
++        val pixels = when (unit) {
++            ImageSizeUnit.Pixels -> safeValue
++            ImageSizeUnit.Centimeters -> safeValue / 2.54f * safeDpi
++            ImageSizeUnit.Millimeters -> safeValue / 25.4f * safeDpi
++            ImageSizeUnit.Inches -> safeValue * safeDpi
++        }
++        return pixels.toInt().coerceIn(1, ImageEditOptions.MAX_RESIZE_PIXELS)
++    }
++
++    private fun blurBitmap(source: Bitmap, radius: Int): Bitmap {
++        if (radius <= 0) return source
++        val width = source.width
++        val height = source.height
++        if (width < 3 || height < 3) return source
++        val pixels = IntArray(width * height)
++        source.getPixels(pixels, 0, width, 0, 0, width, height)
++        val buffer = IntArray(pixels.size)
++        blurPassHorizontal(pixels, buffer, width, height, radius)
++        blurPassVertical(buffer, pixels, width, height, radius)
++        val output = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
++        output.setPixels(pixels, 0, width, 0, 0, width, height)
++        return output
++    }
++
++    private fun blurPassHorizontal(source: IntArray, target: IntArray, width: Int, height: Int, radius: Int) {
++        for (y in 0 until height) {
++            val rowStart = y * width
++            for (x in 0 until width) {
++                var alpha = 0
++                var red = 0
++                var green = 0
++                var blue = 0
++                var count = 0
++                val from = (x - radius).coerceAtLeast(0)
++                val to = (x + radius).coerceAtMost(width - 1)
++                for (i in from..to) {
++                    val pixel = source[rowStart + i]
++                    alpha += (pixel ushr 24) and 0xFF
++                    red += (pixel ushr 16) and 0xFF
++                    green += (pixel ushr 8) and 0xFF
++                    blue += pixel and 0xFF
++                    count += 1
++                }
++                target[rowStart + x] = ((alpha / count) shl 24) or ((red / count) shl 16) or
++                    ((green / count) shl 8) or (blue / count)
++            }
++        }
++    }
++
++    private fun blurPassVertical(source: IntArray, target: IntArray, width: Int, height: Int, radius: Int) {
++        for (x in 0 until width) {
++            for (y in 0 until height) {
++                var alpha = 0
++                var red = 0
++                var green = 0
++                var blue = 0
++                var count = 0
++                val from = (y - radius).coerceAtLeast(0)
++                val to = (y + radius).coerceAtMost(height - 1)
++                for (i in from..to) {
++                    val pixel = source[i * width + x]
++                    alpha += (pixel ushr 24) and 0xFF
++                    red += (pixel ushr 16) and 0xFF
++                    green += (pixel ushr 8) and 0xFF
++                    blue += pixel and 0xFF
++                    count += 1
++                }
++                target[y * width + x] = ((alpha / count) shl 24) or ((red / count) shl 16) or
++                    ((green / count) shl 8) or (blue / count)
++            }
++        }
++    }
++
++    private fun applyImageColorMode(source: Bitmap, mode: ImageColorMode): Bitmap {
++        val output = source.copy(Bitmap.Config.ARGB_8888, true) ?: return source
++        val width = output.width
++        val height = output.height
++        val pixels = IntArray(width * height)
++        output.getPixels(pixels, 0, width, 0, 0, width, height)
++        for (index in pixels.indices) {
++            val pixel = pixels[index]
++            val alpha = (pixel ushr 24) and 0xFF
++            val red = (pixel ushr 16) and 0xFF
++            val green = (pixel ushr 8) and 0xFF
++            val blue = pixel and 0xFF
++            pixels[index] = when (mode) {
++                ImageColorMode.Grayscale -> {
++                    val gray = (red * 299 + green * 587 + blue * 114) / 1000
++                    (alpha shl 24) or (gray shl 16) or (gray shl 8) or gray
++                }
++                ImageColorMode.Inverted ->
++                    (alpha shl 24) or ((255 - red) shl 16) or ((255 - green) shl 8) or (255 - blue)
++                ImageColorMode.Original -> pixel
++            }
++        }
++        output.setPixels(pixels, 0, width, 0, 0, width, height)
++        return output
++    }
++
++    private fun watermarkBitmap(source: Bitmap, edit: ImageEditOptions): Bitmap {
++        val text = edit.watermarkText?.trim().orEmpty()
++        if (text.isEmpty()) return source
++        val output = source.copy(Bitmap.Config.ARGB_8888, true) ?: return source
++        val shorterSide = minOf(output.width, output.height).toFloat()
++        val textSize = (shorterSide * edit.watermarkSizePercent.coerceIn(2, 30) / 100f).coerceAtLeast(10f)
++        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
++            color = Color.WHITE
++            this.textSize = textSize
++            isFakeBoldText = true
++            setShadowLayer(textSize / 6f, 0f, 0f, Color.argb(170, 0, 0, 0))
++            alpha = edit.watermarkOpacity.coerceIn(5, 100) * 255 / 100
++        }
++        val metrics = paint.fontMetrics
++        val textWidth = paint.measureText(text)
++        val margin = (shorterSide * 0.04f).coerceAtLeast(8f)
++        val position = edit.watermarkPosition.coerceIn(1, 9)
++        val column = (position - 1) % 3
++        val row = (position - 1) / 3
++        val x = when (column) {
++            0 -> margin
++            1 -> (output.width - textWidth) / 2f
++            else -> output.width - textWidth - margin
++        }
++        val y = when (row) {
++            0 -> margin - metrics.ascent
++            1 -> output.height / 2f - (metrics.ascent + metrics.descent) / 2f
++            else -> output.height - margin - metrics.descent
++        }
++        Canvas(output).drawText(
++            text,
++            x.coerceIn(0f, (output.width - textWidth).coerceAtLeast(0f)),
++            y.coerceIn(textSize, output.height.toFloat()),
++            paint
++        )
++        return output
++    }
++
+     private fun writeIcoImageFile(
+@@ -4209,3 +4823,3 @@ class ConversionService : Service() {
+                 }
+-                input.videoOptions.videoBitrate?.let { bitrate ->
++                effectiveVideoBitrate(input.videoOptions, totalDurationMs, includeAudio, videoAudioOptions)?.let { bitrate ->
+                     add("-b:v")
+@@ -4882,3 +5496,3 @@ class ConversionService : Service() {
+             }
+-            input.videoOptions.videoBitrate?.let { bitrate ->
++            effectiveVideoBitrate(input.videoOptions, durationMs, includeAudio, videoAudioOptions)?.let { bitrate ->
+                 add("-b:v")
+@@ -4933,2 +5547,22 @@ class ConversionService : Service() {
+ 
++    private fun effectiveVideoBitrate(
++        videoOptions: VideoExportOptions,
++        durationMs: Long?,
++        includeAudio: Boolean,
++        videoAudioOptions: AudioExportOptions
++    ): Int? {
++        val target = targetBitrateForSize(videoOptions.targetSizeBytes, durationMs)
++        if (target != null) {
++            val audioBits = if (includeAudio) {
++                targetBitrateForSize(videoAudioOptions.targetSizeBytes, durationMs)
++                    ?: videoAudioOptions.audioBitrate
++                    ?: DEFAULT_TARGET_AUDIO_BITRATE_BPS
++            } else {
++                0
++            }
++            return (target - audioBits).coerceAtLeast(MIN_TARGET_VIDEO_BITRATE_BPS)
++        }
++        return videoOptions.videoBitrate
++    }
++
+     private fun ffmpegVideoAudioOptionsFor(
+@@ -4963,3 +5597,5 @@ class ConversionService : Service() {
+             } else {
+-                audioOptions.audioBitrate?.let { bitrate ->
++                val targetAudioBitrate = targetBitrateForSize(audioOptions.targetSizeBytes, durationMs)
++                    ?.coerceAtLeast(MIN_TARGET_AUDIO_BITRATE_BPS)
++                (targetAudioBitrate ?: audioOptions.audioBitrate)?.let { bitrate ->
+                     add("-b:a")
+@@ -5415,2 +6051,14 @@ class ConversionService : Service() {
+             )
++            "aac" -> FfmpegAudioProfile(
++                codec = FFMPEG_AAC_ENCODER,
++                format = "adts",
++                requiredEncoder = FFMPEG_AAC_ENCODER
++            )
++            "aiff" -> FfmpegAudioProfile(
++                codec = FFMPEG_PCM_S16BE_ENCODER,
++                format = "aiff",
++                supportsBitrate = false,
++                requiredEncoder = FFMPEG_PCM_S16BE_ENCODER
++            )
++            "m4r" -> ffmpegAacAudioProfile()
+             else -> null
+@@ -7138,2 +7786,5 @@ class ConversionService : Service() {
+                     "opus" -> OutputProfile(extension = "opus", mimeType = MIME_TYPE_OPUS, kind = OutputMediaKind.Audio)
++                    "aac" -> OutputProfile(extension = "aac", mimeType = MIME_TYPE_AAC, kind = OutputMediaKind.Audio)
++                    "aiff" -> OutputProfile(extension = "aiff", mimeType = MIME_TYPE_AIFF, kind = OutputMediaKind.Audio)
++                    "m4r" -> OutputProfile(extension = "m4r", mimeType = MIME_TYPE_M4R, kind = OutputMediaKind.Audio)
+                     else -> null
+@@ -7176,3 +7827,8 @@ class ConversionService : Service() {
+                         TargetId.fromKey(input.targetFormat) == TargetId.PdfDecrypt ||
+-                        TargetId.fromKey(input.targetFormat) == TargetId.PdfCompress ->
++                        TargetId.fromKey(input.targetFormat) == TargetId.PdfCompress ||
++                        TargetId.fromKey(input.targetFormat) == TargetId.PdfRotate ||
++                        TargetId.fromKey(input.targetFormat) == TargetId.PdfOrganize ||
++                        TargetId.fromKey(input.targetFormat) == TargetId.PdfPageNumbers ||
++                        TargetId.fromKey(input.targetFormat) == TargetId.PdfWatermark ||
++                        TargetId.fromKey(input.targetFormat) == TargetId.PdfCrop ->
+                         OutputProfile(extension = "pdf", mimeType = MIME_TYPE_PDF, kind = OutputMediaKind.Document)
+@@ -7219,3 +7875,6 @@ class ConversionService : Service() {
+             normalized.contains("mp3") -> "mp3"
+-            normalized.contains("m4a") || normalized.contains("aac") -> "m4a"
++            normalized.contains("m4a") -> "m4a"
++            normalized.contains("aac") -> "aac"
++            normalized.contains("aiff") || normalized.contains("aif") -> "aiff"
++            normalized.contains("m4r") -> "m4r"
+             normalized.contains("wav") -> "wav"
+@@ -7622,2 +8281,3 @@ class ConversionService : Service() {
+         private const val FFMPEG_OPUS_ENCODER = "libopus"
++        private const val FFMPEG_PCM_S16BE_ENCODER = "pcm_s16be"
+         private val OPUS_SUPPORTED_SAMPLE_RATES = setOf(48_000, 24_000, 16_000, 12_000, 8_000)
+@@ -7652,2 +8312,5 @@ class ConversionService : Service() {
+         private const val MIME_TYPE_M4A = "audio/mp4"
++        private const val MIME_TYPE_AAC = "audio/aac"
++        private const val MIME_TYPE_AIFF = "audio/aiff"
++        private const val MIME_TYPE_M4R = "audio/mp4"
+         private const val MIME_TYPE_WAV = "audio/wav"
+diff --git a/app/src/main/java/org/zenconverter/app/conversion/ConversionTaskStore.kt b/app/src/main/java/org/zenconverter/app/conversion/ConversionTaskStore.kt
+index bd42038..8491722 100644
+--- a/app/src/main/java/org/zenconverter/app/conversion/ConversionTaskStore.kt
++++ b/app/src/main/java/org/zenconverter/app/conversion/ConversionTaskStore.kt
+@@ -130,3 +130,4 @@ data class VideoExportOptions(
+     val trimRange: MediaTrimRange = MediaTrimRange(),
+-    val advanced: VideoAdvancedOptions = VideoAdvancedOptions()
++    val advanced: VideoAdvancedOptions = VideoAdvancedOptions(),
++    val targetSizeBytes: Long? = null
+ ) {
+@@ -160,3 +161,4 @@ data class AudioExportOptions(
+     val trimRange: MediaTrimRange = MediaTrimRange(),
+-    val advanced: AudioAdvancedOptions = AudioAdvancedOptions()
++    val advanced: AudioAdvancedOptions = AudioAdvancedOptions(),
++    val targetSizeBytes: Long? = null
+ )
+@@ -170,2 +172,18 @@ const val DEFAULT_MP3_VBR_QUALITY = 2
+ 
++const val MIN_TARGET_VIDEO_BITRATE_BPS = 100_000
++const val MIN_TARGET_AUDIO_BITRATE_BPS = 16_000
++const val DEFAULT_TARGET_AUDIO_BITRATE_BPS = 128_000
++
++/**
++ * Derives the bitrate needed to keep an output at or below [targetSizeBytes] for the
++ * given duration. Returns null when no target is set or the duration is unknown.
++ */
++fun targetBitrateForSize(targetSizeBytes: Long?, durationMs: Long?): Int? {
++    if (targetSizeBytes == null || targetSizeBytes <= 0L) return null
++    val duration = durationMs?.takeIf { it > 0L } ?: return null
++    val bitsPerSecond = (targetSizeBytes.toDouble() * 8.0) / (duration.toDouble() / 1000.0)
++    if (!bitsPerSecond.isFinite() || bitsPerSecond <= 0.0) return null
++    return bitsPerSecond.toLong().coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
++}
++
+ data class MediaTrimRange(
+@@ -281,2 +299,89 @@ enum class ImageSuperResolutionMode(val scale: Int) {
+ 
++enum class ImageResizeMode {
++    Off,
++    Exact,
++    Percent,
++    FitLongSide
++}
++
++enum class ImageSizeUnit {
++    Pixels,
++    Centimeters,
++    Millimeters,
++    Inches
++}
++
++enum class ImageRotateMode {
++    None,
++    Clockwise90,
++    Rotate180,
++    CounterClockwise90
++}
++
++enum class ImageFlipMode {
++    None,
++    Horizontal,
++    Vertical,
++    Both
++}
++
++enum class ImageCropMode {
++    Off,
++    Square,
++    FourThree,
++    ThreeFour,
++    SixteenNine,
++    NineSixteen,
++    Circle
++}
++
++enum class ImageColorMode {
++    Original,
++    Grayscale,
++    Inverted
++}
++
++enum class ImageBlurMode {
++    Off,
++    Light,
++    Standard,
++    Heavy
++}
++
++/**
++ * Non-destructive edits applied to an image right before it is encoded, so every
++ * existing image target gains resize, crop, rotate, colour, blur and watermark.
++ */
++data class ImageEditOptions(
++    val resizeMode: ImageResizeMode = ImageResizeMode.Off,
++    val resizeWidth: Float = 1080f,
++    val resizeHeight: Float = 1080f,
++    val sizeUnit: ImageSizeUnit = ImageSizeUnit.Pixels,
++    val dpi: Int = 300,
++    val keepAspect: Boolean = true,
++    val rotate: ImageRotateMode = ImageRotateMode.None,
++    val flip: ImageFlipMode = ImageFlipMode.None,
++    val crop: ImageCropMode = ImageCropMode.Off,
++    val colorMode: ImageColorMode = ImageColorMode.Original,
++    val blur: ImageBlurMode = ImageBlurMode.Off,
++    val watermarkText: String? = null,
++    val watermarkPosition: Int = 8,
++    val watermarkOpacity: Int = 60,
++    val watermarkSizePercent: Int = 6
++) {
++    val hasEdits: Boolean
++        get() = resizeMode != ImageResizeMode.Off ||
++            rotate != ImageRotateMode.None ||
++            flip != ImageFlipMode.None ||
++            crop != ImageCropMode.Off ||
++            colorMode != ImageColorMode.Original ||
++            blur != ImageBlurMode.Off ||
++            !watermarkText.isNullOrBlank()
++
++    companion object {
++        const val MAX_RESIZE_PIXELS = 12_000
++        const val MAX_DPI = 1200
++    }
++}
++
+ data class ImageExportOptions(
+@@ -284,5 +389,34 @@ data class ImageExportOptions(
+     val webpLossless: Boolean = false,
+-    val superResolution: ImageSuperResolutionMode = ImageSuperResolutionMode.Off
++    val superResolution: ImageSuperResolutionMode = ImageSuperResolutionMode.Off,
++    val targetSizeBytes: Long? = null,
++    val edit: ImageEditOptions = ImageEditOptions()
+ )
+ 
++enum class PdfPageNumberPosition {
++    BottomCentre,
++    BottomLeft,
++    BottomRight,
++    TopCentre,
++    TopLeft,
++    TopRight
++}
++
++/**
++ * Options for the offline PDF tools: rotate, organise, page numbers, watermark, crop.
++ */
++data class PdfToolOptions(
++    val rotateDegrees: Int = 90,
++    val pageOrder: String = "",
++    val pageNumberPosition: PdfPageNumberPosition = PdfPageNumberPosition.BottomCentre,
++    val pageNumberStart: Int = 1,
++    val watermarkText: String? = null,
++    val watermarkOpacity: Int = 30,
++    val watermarkRotation: Int = 45,
++    val cropMarginPercent: Int = 5
++) {
++    companion object {
++        const val MAX_PAGE_ORDER_LENGTH = 2000
++    }
++}
++
+ data class PdfExportOptions(
+@@ -290,3 +424,4 @@ data class PdfExportOptions(
+     val renderQuality: PdfRenderQuality = PdfRenderQuality.Balanced,
+-    val compressionPreset: PdfCompressionPreset = PdfCompressionPreset.Balanced
++    val compressionPreset: PdfCompressionPreset = PdfCompressionPreset.Balanced,
++    val tool: PdfToolOptions = PdfToolOptions()
+ )
+diff --git a/app/src/main/java/org/zenconverter/app/conversion/TargetId.kt b/app/src/main/java/org/zenconverter/app/conversion/TargetId.kt
+index 025ef5a..04ee105 100644
+--- a/app/src/main/java/org/zenconverter/app/conversion/TargetId.kt
++++ b/app/src/main/java/org/zenconverter/app/conversion/TargetId.kt
+@@ -16,2 +16,5 @@ enum class TargetId(val key: String) {
+     Opus("OPUS"),
++    Aac("AAC"),
++    Aiff("AIFF"),
++    M4r("M4R"),
+     Jpg("JPG"),
+@@ -27,2 +30,7 @@ enum class TargetId(val key: String) {
+     PdfDecrypt("pdf_decrypt"),
++    PdfRotate("pdf_rotate"),
++    PdfOrganize("pdf_organize"),
++    PdfPageNumbers("pdf_page_numbers"),
++    PdfWatermark("pdf_watermark"),
++    PdfCrop("pdf_crop"),
+     Woff2("WOFF2"),
+diff --git a/app/src/main/java/org/zenconverter/app/download/LinkDownloader.kt b/app/src/main/java/org/zenconverter/app/download/LinkDownloader.kt
+new file mode 100644
+index 0000000..4290d18
+--- /dev/null
++++ b/app/src/main/java/org/zenconverter/app/download/LinkDownloader.kt
+@@ -0,0 +1,181 @@
++package org.zenconverter.app.download
++
++import android.content.ContentValues
++import android.content.Context
++import android.os.Build
++import android.os.Environment
++import android.provider.MediaStore
++import com.yausername.youtubedl_android.YoutubeDL
++import com.yausername.youtubedl_android.YoutubeDLRequest
++import java.io.File
++import java.util.concurrent.atomic.AtomicBoolean
++
++/** What the user asked a pasted link to produce. */
++enum class LinkQuality(
++    val label: String,
++    val formatSelector: String,
++    val audioFormat: String?
++) {
++    VideoBest(
++        label = "Video · best",
++        formatSelector = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
++        audioFormat = null
++    ),
++    Video1080(
++        label = "Video · 1080p",
++        formatSelector = "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]/best[height<=1080]/best",
++        audioFormat = null
++    ),
++    Video720(
++        label = "Video · 720p",
++        formatSelector = "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]/best",
++        audioFormat = null
++    ),
++    Video480(
++        label = "Video · 480p",
++        formatSelector = "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]/best[height<=480]/best",
++        audioFormat = null
++    ),
++    AudioMp3(
++        label = "Music · MP3",
++        formatSelector = "bestaudio/best",
++        audioFormat = "mp3"
++    ),
++    AudioM4a(
++        label = "Music · M4A",
++        formatSelector = "bestaudio/best",
++        audioFormat = "m4a"
++    );
++
++    val isAudioOnly: Boolean get() = audioFormat != null
++
++    companion object {
++        val DEFAULT = Video1080
++        fun fromLabel(label: String): LinkQuality = entries.firstOrNull { it.label == label } ?: DEFAULT
++    }
++}
++
++/** A finished download: the file plus whatever yt-dlp reported about it. */
++data class LinkDownloadResult(
++    val file: File,
++    val title: String?
++)
++
++/**
++ * Wraps youtubedl-android so a pasted link becomes a local file. Downloads land in the app's
++ * private directory, so no storage permission is needed and nothing is written to shared storage.
++ */
++object LinkDownloader {
++
++    private val initialized = AtomicBoolean(false)
++
++    /** yt-dlp ships a Python runtime that must be unpacked once before the first run. */
++    fun ensureInitialized(context: Context) {
++        if (initialized.get()) return
++        synchronized(this) {
++            if (initialized.get()) return
++            val appContext = context.applicationContext
++            YoutubeDL.getInstance().init(appContext)
++            // The ffmpeg module is resolved reflectively: if it is absent or renamed, a pasted
++            // link still downloads, it just cannot merge separate video/audio streams.
++            runCatching {
++                val ffmpegClass = Class.forName("com.yausername.ffmpeg.FFmpeg")
++                val instance = ffmpegClass.getMethod("getInstance").invoke(null)
++                ffmpegClass.getMethod("init", Context::class.java).invoke(instance, appContext)
++            }
++            initialized.set(true)
++        }
++    }
++
++    fun download(
++        context: Context,
++        url: String,
++        quality: LinkQuality,
++        processId: String,
++        onProgress: (Float, Long) -> Unit
++    ): LinkDownloadResult {
++        ensureInitialized(context)
++        val targetDir = File(context.filesDir, DOWNLOAD_DIR_NAME).apply { mkdirs() }
++        val request = YoutubeDLRequest(url.trim())
++        request.addOption("--no-mtime")
++        request.addOption("--no-playlist")
++        request.addOption("--no-warnings")
++        request.addOption("-o", File(targetDir, "%(title).120s.%(ext)s").absolutePath)
++        request.addOption("-f", quality.formatSelector)
++        if (quality.audioFormat != null) {
++            request.addOption("--extract-audio")
++            request.addOption("--audio-format", quality.audioFormat)
++        } else {
++            request.addOption("--merge-output-format", "mp4")
++        }
++        // Ask yt-dlp for the finished path so the caller never has to guess the file name.
++        request.addOption("--print", "after_move:filepath")
++
++        val response = YoutubeDL.getInstance().execute(
++            request = request,
++            processId = processId,
++            callback = { progress, etaSeconds, _ -> onProgress(progress, etaSeconds) }
++        )
++        val reportedPath = response.out
++            .lineSequence()
++            .map { it.trim() }
++            .lastOrNull { it.isNotEmpty() }
++        val file = reportedPath
++            ?.let { File(it) }
++            ?.takeIf { it.isFile }
++            ?: targetDir.listFiles()
++                ?.filter { it.isFile }
++                ?.maxByOrNull { it.lastModified() }
++            ?: throw LinkDownloadException("The download finished but no file was produced.")
++        return LinkDownloadResult(
++            file = file,
++            title = file.name.substringBeforeLast('.').takeIf { it.isNotBlank() }
++        )
++    }
++
++    fun cancel(processId: String) {
++        runCatching { YoutubeDL.getInstance().destroyProcessById(processId) }
++    }
++
++    /**
++     * Copies a finished download into the public Downloads collection so it shows up in the
++     * gallery and any file manager, instead of staying in the app's private folder.
++     */
++    fun publishToDownloads(context: Context, source: File, displayName: String, mimeType: String): String {
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
++            val values = ContentValues().apply {
++                put(MediaStore.MediaColumns.DISPLAY_NAME, displayName)
++                put(MediaStore.MediaColumns.MIME_TYPE, mimeType)
++                put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
++            }
++            val resolver = context.contentResolver
++            val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
++                ?: throw LinkDownloadException("Could not create the output file in Downloads.")
++            resolver.openOutputStream(uri)?.use { output ->
++                source.inputStream().use { input -> input.copyTo(output) }
++            } ?: throw LinkDownloadException("Could not write the output file in Downloads.")
++            return displayName
++        }
++        val directory = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
++        directory.mkdirs()
++        val destination = File(directory, displayName)
++        source.inputStream().use { input -> destination.outputStream().use { input.copyTo(it) } }
++        return destination.absolutePath
++    }
++
++    fun mimeTypeFor(fileName: String): String = when (fileName.substringAfterLast('.', "").lowercase()) {
++        "mp4" -> "video/mp4"
++        "webm" -> "video/webm"
++        "mkv" -> "video/x-matroska"
++        "mov" -> "video/quicktime"
++        "mp3" -> "audio/mpeg"
++        "m4a" -> "audio/mp4"
++        "aac" -> "audio/aac"
++        "opus" -> "audio/opus"
++        else -> "application/octet-stream"
++    }
++
++    private const val DOWNLOAD_DIR_NAME = "link-downloads"
++}
++
++class LinkDownloadException(message: String) : Exception(message)
+diff --git a/app/src/main/java/org/zenconverter/app/ui/UiText.kt b/app/src/main/java/org/zenconverter/app/ui/UiText.kt
+index 23f94f9..a8d50db 100644
+--- a/app/src/main/java/org/zenconverter/app/ui/UiText.kt
++++ b/app/src/main/java/org/zenconverter/app/ui/UiText.kt
+@@ -535,2 +535,9 @@ internal class UiText(private val context: Context) {
+ 
++    val targetSize: String
++        get() = text(R.string.ui_target_size)
++
++    fun targetSizeHint(): String {
++        return text(R.string.ui_target_size_hint)
++    }
++
+     val pageSize: String
+diff --git a/app/src/main/java/org/zenconverter/app/ui/ZenConverterApp.kt b/app/src/main/java/org/zenconverter/app/ui/ZenConverterApp.kt
+index 49da19f..05faafb 100644
+--- a/app/src/main/java/org/zenconverter/app/ui/ZenConverterApp.kt
++++ b/app/src/main/java/org/zenconverter/app/ui/ZenConverterApp.kt
+@@ -86,2 +86,3 @@ import androidx.compose.material.icons.rounded.Add
+ import androidx.compose.material.icons.rounded.AudioFile
++import androidx.compose.material.icons.rounded.Link
+ import androidx.compose.material.icons.rounded.Check
+@@ -126,2 +127,5 @@ import androidx.compose.material3.RangeSliderState
+ import androidx.compose.material3.Scaffold
++import androidx.compose.material3.Shapes
++import androidx.compose.material3.Typography
++import androidx.compose.material3.Slider
+ import androidx.compose.material3.SliderColors
+@@ -139,2 +143,7 @@ import androidx.compose.runtime.getValue
+ import androidx.compose.runtime.mutableStateOf
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.withContext
++import org.zenconverter.app.download.LinkDownloader
++import org.zenconverter.app.download.LinkQuality
+ import androidx.compose.runtime.remember
+@@ -151,2 +160,3 @@ import androidx.compose.ui.geometry.Offset
+ import androidx.compose.ui.geometry.Size
++import androidx.compose.ui.graphics.Brush
+ import androidx.compose.ui.graphics.Color
+@@ -180,2 +190,3 @@ import androidx.compose.ui.text.style.TextOverflow
+ import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
+ import androidx.compose.ui.unit.Dp
+@@ -190,3 +201,11 @@ import org.zenconverter.app.conversion.FileBasicInfo
+ import org.zenconverter.app.conversion.GifFrameExportMode
++import org.zenconverter.app.conversion.ImageBlurMode
++import org.zenconverter.app.conversion.ImageColorMode
++import org.zenconverter.app.conversion.ImageCropMode
++import org.zenconverter.app.conversion.ImageEditOptions
+ import org.zenconverter.app.conversion.ImageExportOptions
++import org.zenconverter.app.conversion.ImageFlipMode
++import org.zenconverter.app.conversion.ImageResizeMode
++import org.zenconverter.app.conversion.ImageRotateMode
++import org.zenconverter.app.conversion.ImageSizeUnit
+ import org.zenconverter.app.conversion.ImageSuperResolutionMode
+@@ -199,3 +218,5 @@ import org.zenconverter.app.conversion.PdfImagePageMode
+ import org.zenconverter.app.conversion.PdfRenderQuality
++import org.zenconverter.app.conversion.PdfPageNumberPosition
+ import org.zenconverter.app.conversion.PdfSecurityOptions
++import org.zenconverter.app.conversion.PdfToolOptions
+ import org.zenconverter.app.conversion.VideoAdvancedOptions
+@@ -272,3 +293,6 @@ enum class FileCategory(
+             TargetFormat(TargetId.Wma, "wma", "Re-encode"),
+-            TargetFormat(TargetId.Opus, "opus", "Re-encode")
++            TargetFormat(TargetId.Opus, "opus", "Re-encode"),
++            TargetFormat(TargetId.Aac, "aac", "Music / streams"),
++            TargetFormat(TargetId.Aiff, "aiff", "Uncompressed"),
++            TargetFormat(TargetId.M4r, "m4r", "iPhone ringtone")
+         )
+@@ -307,3 +331,8 @@ enum class FileCategory(
+             TargetFormat(TargetId.PdfEncrypt, "pdf", "Password protect"),
+-            TargetFormat(TargetId.PdfDecrypt, "pdf", "Remove password")
++            TargetFormat(TargetId.PdfDecrypt, "pdf", "Remove password"),
++            TargetFormat(TargetId.PdfRotate, "pdf", "Rotate pages"),
++            TargetFormat(TargetId.PdfOrganize, "pdf", "Reorder or drop pages"),
++            TargetFormat(TargetId.PdfPageNumbers, "pdf", "Add page numbers"),
++            TargetFormat(TargetId.PdfWatermark, "pdf", "Stamp a watermark"),
++            TargetFormat(TargetId.PdfCrop, "pdf", "Trim margins")
+         )
+@@ -508,12 +537,12 @@ internal enum class AccentColorOption(
+     Dynamic("Material You", Color(0xFF6750A4), Color.White, Color(0xFFD0BCFF), Color(0xFF381E72)),
+-    Charcoal("Charcoal", Color(0xFF111111), Color.White, Color(0xFFE5E7EB), Color(0xFF111111)),
+-    DeepNavy("Deep Navy", Color(0xFF36454F), Color.White, Color(0xFF93C5FD), Color(0xFF0F172A)),
+-    ForestGreen("Forest Green", Color(0xFF2D4A2B), Color.White, Color(0xFF86EFAC), Color(0xFF052E16)),
+-    SteelBlue("Steel Blue", Color(0xFF4A6FA5), Color.White, Color(0xFF60A5FA), Color(0xFF0F172A)),
+-    DustyRose("Dusty Rose", Color(0xFFD4A5A5), Color(0xFF111111), Color(0xFFFDA4AF), Color(0xFF4C0519)),
+-    Mustard("Mustard", Color(0xFFF4A900), Color(0xFF111111), Color(0xFFFCD34D), Color(0xFF451A03)),
+-    BurntOrange("Burnt Orange", Color(0xFFE76F51), Color(0xFF111111), Color(0xFFFB923C), Color(0xFF431407)),
+-    ElectricBlue("Electric Blue", Color(0xFF0066FF), Color.White, Color(0xFF38BDF8), Color(0xFF082F49)),
+-    FernGreen("Fern Green", Color(0xFF4A7C59), Color.White, Color(0xFF34D399), Color(0xFF022C22)),
+-    DeepPurple("Deep Purple", Color(0xFF2B1E3E), Color.White, Color(0xFFC084FC), Color(0xFF3B0764));
++    Charcoal("Charcoal", Color(0xFF141413), Color(0xFFFAF9F5), Color(0xFFFAF9F5), Color(0xFF141413)),
++    DeepNavy("Deep Navy", Color(0xFF2F6BE8), Color(0xFFFFFDF8), Color(0xFF7BA4FF), Color(0xFF0B1220)),
++    ForestGreen("Forest Green", Color(0xFF4A6B3F), Color(0xFFFAF9F5), Color(0xFFA8C79A), Color(0xFF101A0C)),
++    SteelBlue("Steel Blue", Color(0xFF4A7BA7), Color(0xFFFAF9F5), Color(0xFF9CC3E5), Color(0xFF0B1A26)),
++    DustyRose("Dusty Rose", Color(0xFFB5637F), Color(0xFFFAF9F5), Color(0xFFE8A9BE), Color(0xFF3A1524)),
++    Mustard("Mustard", Color(0xFFC08A3E), Color(0xFF141413), Color(0xFFE5C27F), Color(0xFF2A1F0A)),
++    BurntOrange("Burnt Orange", Color(0xFFCC785C), Color(0xFFFAF9F5), Color(0xFFE8A184), Color(0xFF33170F)),
++    ElectricBlue("Electric Blue", Color(0xFF0066FF), Color.White, Color(0xFF6FA8FF), Color(0xFF08172E)),
++    FernGreen("Fern Green", Color(0xFF4E8C6A), Color(0xFFFAF9F5), Color(0xFF8FD3B0), Color(0xFF0A2117)),
++    DeepPurple("Deep Purple", Color(0xFF7C5CE0), Color(0xFFFFFDF8), Color(0xFFB9A6F2), Color(0xFF1C1233));
+ 
+@@ -965,3 +994,7 @@ fun ZenConverterApp(
+     ) {
+-        MaterialTheme(colorScheme = zenConverterColorScheme(context, accent, isDark, isOled)) {
++        MaterialTheme(
++            colorScheme = zenConverterColorScheme(context, accent, isDark, isOled),
++            typography = zenConverterTypography(),
++            shapes = zenConverterShapes()
++        ) {
+             Surface(
+@@ -1145,2 +1178,3 @@ private fun ZenConverterContent(
+     var showImportSourceSheet by rememberSaveable { mutableStateOf(false) }
++    var showLinkDialog by rememberSaveable { mutableStateOf(false) }
+     var showAlbumSourceDialog by rememberSaveable { mutableStateOf(false) }
+@@ -1470,2 +1504,6 @@ private fun ZenConverterContent(
+                         onPickFiles()
++                    },
++                    onOpenLink = {
++                        showImportSourceSheet = false
++                        showLinkDialog = true
+                     }
+@@ -1474,2 +1512,9 @@ private fun ZenConverterContent(
+ 
++            if (showLinkDialog) {
++                LinkDownloadDialog(
++                    texts = texts,
++                    onDismiss = { showLinkDialog = false }
++                )
++            }
++
+             if (showAlbumSourceDialog) {
+@@ -1836,2 +1881,148 @@ private fun ZenPromptActions(
+ 
++private const val LINK_DOWNLOAD_PROCESS_ID = "format-setu-link"
++
++/**
++ * Paste a link, pick a quality, download. The finished file is copied into the public
++ * Downloads collection so it appears in the gallery and any file manager.
++ */
++@Composable
++private fun LinkDownloadDialog(
++    texts: UiText,
++    onDismiss: () -> Unit
++) {
++    val context = LocalContext.current
++    val scope = rememberCoroutineScope()
++    var url by remember { mutableStateOf("") }
++    var quality by remember { mutableStateOf(LinkQuality.DEFAULT) }
++    var running by remember { mutableStateOf(false) }
++    var progress by remember { mutableStateOf(0f) }
++    var status by remember { mutableStateOf<String?>(null) }
++
++    androidx.compose.ui.window.Dialog(onDismissRequest = { if (!running) onDismiss() }) {
++        Column(
++            modifier = Modifier
++                .fillMaxWidth()
++                .clip(RoundedCornerShape(20.dp))
++                .background(MaterialTheme.colorScheme.surface)
++                .padding(20.dp),
++            verticalArrangement = Arrangement.spacedBy(12.dp)
++        ) {
++            Text(
++                text = "Download from a link",
++                style = MaterialTheme.typography.titleMedium,
++                color = MaterialTheme.colorScheme.onSurface
++            )
++            Text(
++                text = "Paste a video or music link. It downloads on this device, then converts like any other file.",
++                style = MaterialTheme.typography.bodySmall,
++                color = MaterialTheme.colorScheme.onSurfaceVariant
++            )
++            OutlinedTextField(
++                value = url,
++                onValueChange = { url = it.trim() },
++                singleLine = true,
++                enabled = !running,
++                label = { Text("Link") },
++                colors = OutlinedTextFieldDefaults.colors(
++                    focusedBorderColor = MaterialTheme.colorScheme.primary,
++                    unfocusedBorderColor = MaterialTheme.colorScheme.outline,
++                    focusedLabelColor = MaterialTheme.colorScheme.primary,
++                    unfocusedLabelColor = MaterialTheme.colorScheme.onSurfaceVariant,
++                    cursorColor = MaterialTheme.colorScheme.primary,
++                    focusedContainerColor = MaterialTheme.colorScheme.surface,
++                    unfocusedContainerColor = MaterialTheme.colorScheme.surface
++                ),
++                modifier = Modifier.fillMaxWidth()
++            )
++            LinkQuality.values().forEach { option ->
++                val selected = option == quality
++                Row(
++                    modifier = Modifier
++                        .fillMaxWidth()
++                        .clip(RoundedCornerShape(10.dp))
++                        .background(
++                            MaterialTheme.colorScheme.primary.copy(alpha = if (selected) 0.14f else 0.04f)
++                        )
++                        .clickable(enabled = !running) { quality = option }
++                        .padding(horizontal = 12.dp, vertical = 10.dp),
++                    verticalAlignment = Alignment.CenterVertically
++                ) {
++                    Text(
++                        text = option.label,
++                        style = MaterialTheme.typography.bodyMedium,
++                        color = if (selected) {
++                            MaterialTheme.colorScheme.primary
++                        } else {
++                            MaterialTheme.colorScheme.onSurface
++                        }
++                    )
++                }
++            }
++            if (running) {
++                Text(
++                    text = "Downloading \u2026 ${progress.coerceIn(0f, 100f).toInt()}%",
++                    style = MaterialTheme.typography.bodySmall,
++                    color = MaterialTheme.colorScheme.primary
++                )
++            }
++            status?.let { message ->
++                Text(
++                    text = message,
++                    style = MaterialTheme.typography.bodySmall,
++                    color = MaterialTheme.colorScheme.onSurfaceVariant
++                )
++            }
++            Row(
++                modifier = Modifier.fillMaxWidth(),
++                horizontalArrangement = Arrangement.End
++            ) {
++                Button(
++                    onClick = {
++                        if (running) {
++                            LinkDownloader.cancel(LINK_DOWNLOAD_PROCESS_ID)
++                            return@Button
++                        }
++                        val link = url.trim()
++                        if (link.isEmpty()) {
++                            status = "Paste a link first."
++                            return@Button
++                        }
++                        running = true
++                        progress = 0f
++                        status = "Starting \u2026"
++                        scope.launch {
++                            val outcome = withContext(Dispatchers.IO) {
++                                runCatching {
++                                    val result = LinkDownloader.download(
++                                        context = context,
++                                        url = link,
++                                        quality = quality,
++                                        processId = LINK_DOWNLOAD_PROCESS_ID,
++                                        onProgress = { value, _ -> progress = value }
++                                    )
++                                    LinkDownloader.publishToDownloads(
++                                        context = context,
++                                        source = result.file,
++                                        displayName = result.file.name,
++                                        mimeType = LinkDownloader.mimeTypeFor(result.file.name)
++                                    )
++                                }
++                            }
++                            running = false
++                            status = outcome.fold(
++                                onSuccess = { savedAs -> "Saved to Downloads: $savedAs" },
++                                onFailure = { error ->
++                                    "Could not download: ${error.message ?: "unknown error"}"
++                                }
++                            )
++                        }
++                    }
++                ) {
++                    Text(if (running) "Cancel" else "Download")
++                }
++            }
++        }
++    }
++}
++
+ @Composable
+@@ -1867,3 +2058,3 @@ private fun Header(
+                     .size(40.dp)
+-                    .clip(RoundedCornerShape(8.dp))
++                    .clip(RoundedCornerShape(12.dp))
+             )
+@@ -1877,3 +2068,3 @@ private fun Header(
+                     style = MaterialTheme.typography.titleLarge,
+-                    fontWeight = FontWeight.SemiBold,
++                    fontWeight = FontWeight.Medium,
+                     color = MaterialTheme.colorScheme.onBackground,
+@@ -2637,3 +2828,4 @@ private fun ImportSourceSheet(
+     onPickFolder: () -> Unit,
+-    onPickFiles: () -> Unit
++    onPickFiles: () -> Unit,
++    onOpenLink: () -> Unit
+ ) {
+@@ -2685,2 +2877,8 @@ private fun ImportSourceSheet(
+             )
++            ImportSourceRow(
++                icon = Icons.Rounded.Link,
++                title = "From a link",
++                note = "YouTube and more",
++                onClick = onOpenLink
++            )
+         }
+@@ -3104,2 +3302,16 @@ private fun BatchVideoTargetOptions(
+     OptionGrid {
++        TargetSizeField(
++            valueBytes = commonBatchValue(files) { it.videoOptions.targetSizeBytes },
++            label = texts.targetSize,
++            hint = texts.targetSizeHint(),
++            onValueChange = { bytes ->
++                onOpenMenuChange(null)
++                onUpdateFiles(
++                    files.map { file ->
++                        file.copy(videoOptions = file.videoOptions.copy(targetSizeBytes = bytes))
++                    }
++                )
++            }
++        )
++
+         if (!isGifTarget) {
+@@ -3379,2 +3591,16 @@ private fun BatchAudioTargetOptions(
+     OptionGrid {
++        TargetSizeField(
++            valueBytes = commonBatchValue(files) { it.audioOptions.targetSizeBytes },
++            label = texts.targetSize,
++            hint = texts.targetSizeHint(),
++            onValueChange = { bytes ->
++                onOpenMenuChange(null)
++                onUpdateFiles(
++                    files.map { file ->
++                        file.copy(audioOptions = file.audioOptions.copy(targetSizeBytes = bytes))
++                    }
++                )
++            }
++        )
++
+         if (isMp3Target(target)) {
+@@ -3529,2 +3755,9 @@ private fun BatchAudioTargetOptions(
+ }
++/** Shared value across a batch, or null when the files disagree. */
++private fun <T> commonBatchValue(files: List<QueuedFile>, selector: (QueuedFile) -> T): T? {
++    if (files.isEmpty()) return null
++    val values = files.map(selector).distinct()
++    return if (values.size == 1) values.first() else null
++}
++
+ @Composable
+@@ -3589,2 +3822,29 @@ private fun BatchImageTargetOptions(
+             )
++        },
++        qualityPercent = commonBatchValue(files) { it.imageOptions.quality } ?: 85,
++        onQualityPercentChange = { percent ->
++            onOpenMenuChange(null)
++            onUpdateFiles(
++                files.map { file ->
++                    file.copy(imageOptions = file.imageOptions.copy(quality = percent))
++                }
++            )
++        },
++        editOptions = commonBatchValue(files) { it.imageOptions.edit } ?: ImageEditOptions(),
++        onEditOptionsChange = { edit ->
++            onOpenMenuChange(null)
++            onUpdateFiles(
++                files.map { file ->
++                    file.copy(imageOptions = file.imageOptions.copy(edit = edit))
++                }
++            )
++        },
++        targetSizeBytes = commonBatchValue(files) { it.imageOptions.targetSizeBytes },
++        onTargetSizeChange = { bytes ->
++            onOpenMenuChange(null)
++            onUpdateFiles(
++                files.map { file ->
++                    file.copy(imageOptions = file.imageOptions.copy(targetSizeBytes = bytes))
++                }
++            )
+         }
+@@ -5820,2 +6080,346 @@ private fun AdvancedOptionsPanel(
+ 
++private const val IMAGE_ADJUST_OFF = "Off"
++private const val IMAGE_RESIZE_EXACT = "Exact size"
++private const val IMAGE_RESIZE_PERCENT = "Percent"
++private const val IMAGE_RESIZE_FIT = "Fit long side"
++private const val IMAGE_UNIT_PIXELS = "Pixels"
++private const val IMAGE_UNIT_CENTIMETRES = "Centimetres"
++private const val IMAGE_UNIT_MILLIMETRES = "Millimetres"
++private const val IMAGE_UNIT_INCHES = "Inches"
++private const val IMAGE_ROTATE_90 = "90\u00b0"
++private const val IMAGE_ROTATE_180 = "180\u00b0"
++private const val IMAGE_ROTATE_270 = "270\u00b0"
++private const val IMAGE_FLIP_HORIZONTAL = "Horizontal"
++private const val IMAGE_FLIP_VERTICAL = "Vertical"
++private const val IMAGE_FLIP_BOTH = "Both"
++private const val IMAGE_CROP_SQUARE = "Square 1:1"
++private const val IMAGE_CROP_FOUR_THREE = "4:3"
++private const val IMAGE_CROP_THREE_FOUR = "3:4"
++private const val IMAGE_CROP_SIXTEEN_NINE = "16:9"
++private const val IMAGE_CROP_NINE_SIXTEEN = "9:16"
++private const val IMAGE_CROP_CIRCLE = "Circle"
++private const val IMAGE_COLOR_ORIGINAL = "Original"
++private const val IMAGE_COLOR_GRAYSCALE = "Grayscale"
++private const val IMAGE_COLOR_INVERTED = "Inverted"
++private const val IMAGE_BLUR_LIGHT = "Light"
++private const val IMAGE_BLUR_STANDARD = "Standard"
++private const val IMAGE_BLUR_HEAVY = "Heavy"
++
++private val IMAGE_RESIZE_OPTIONS = listOf(IMAGE_ADJUST_OFF, IMAGE_RESIZE_EXACT, IMAGE_RESIZE_PERCENT, IMAGE_RESIZE_FIT)
++private val IMAGE_SIZE_UNIT_OPTIONS = listOf(IMAGE_UNIT_PIXELS, IMAGE_UNIT_CENTIMETRES, IMAGE_UNIT_MILLIMETRES, IMAGE_UNIT_INCHES)
++private val IMAGE_ROTATE_OPTIONS = listOf(IMAGE_ADJUST_OFF, IMAGE_ROTATE_90, IMAGE_ROTATE_180, IMAGE_ROTATE_270)
++private val IMAGE_FLIP_OPTIONS = listOf(IMAGE_ADJUST_OFF, IMAGE_FLIP_HORIZONTAL, IMAGE_FLIP_VERTICAL, IMAGE_FLIP_BOTH)
++private val IMAGE_CROP_OPTIONS = listOf(
++    IMAGE_ADJUST_OFF,
++    IMAGE_CROP_SQUARE,
++    IMAGE_CROP_FOUR_THREE,
++    IMAGE_CROP_THREE_FOUR,
++    IMAGE_CROP_SIXTEEN_NINE,
++    IMAGE_CROP_NINE_SIXTEEN,
++    IMAGE_CROP_CIRCLE
++)
++private val IMAGE_COLOR_OPTIONS = listOf(IMAGE_COLOR_ORIGINAL, IMAGE_COLOR_GRAYSCALE, IMAGE_COLOR_INVERTED)
++private val IMAGE_BLUR_OPTIONS = listOf(IMAGE_ADJUST_OFF, IMAGE_BLUR_LIGHT, IMAGE_BLUR_STANDARD, IMAGE_BLUR_HEAVY)
++private val IMAGE_WATERMARK_POSITION_OPTIONS = listOf(
++    "Top left",
++    "Top centre",
++    "Top right",
++    "Middle left",
++    "Centre",
++    "Middle right",
++    "Bottom left",
++    "Bottom centre",
++    "Bottom right"
++)
++
++private fun imageResizeModeLabelFor(mode: ImageResizeMode): String = when (mode) {
++    ImageResizeMode.Exact -> IMAGE_RESIZE_EXACT
++    ImageResizeMode.Percent -> IMAGE_RESIZE_PERCENT
++    ImageResizeMode.FitLongSide -> IMAGE_RESIZE_FIT
++    ImageResizeMode.Off -> IMAGE_ADJUST_OFF
++}
++
++private fun imageResizeModeForLabel(label: String): ImageResizeMode = when (label) {
++    IMAGE_RESIZE_EXACT -> ImageResizeMode.Exact
++    IMAGE_RESIZE_PERCENT -> ImageResizeMode.Percent
++    IMAGE_RESIZE_FIT -> ImageResizeMode.FitLongSide
++    else -> ImageResizeMode.Off
++}
++
++private fun imageSizeUnitLabelFor(unit: ImageSizeUnit): String = when (unit) {
++    ImageSizeUnit.Pixels -> IMAGE_UNIT_PIXELS
++    ImageSizeUnit.Centimeters -> IMAGE_UNIT_CENTIMETRES
++    ImageSizeUnit.Millimeters -> IMAGE_UNIT_MILLIMETRES
++    ImageSizeUnit.Inches -> IMAGE_UNIT_INCHES
++}
++
++private fun imageSizeUnitForLabel(label: String): ImageSizeUnit = when (label) {
++    IMAGE_UNIT_CENTIMETRES -> ImageSizeUnit.Centimeters
++    IMAGE_UNIT_MILLIMETRES -> ImageSizeUnit.Millimeters
++    IMAGE_UNIT_INCHES -> ImageSizeUnit.Inches
++    else -> ImageSizeUnit.Pixels
++}
++
++private fun imageRotateLabelFor(mode: ImageRotateMode): String = when (mode) {
++    ImageRotateMode.Clockwise90 -> IMAGE_ROTATE_90
++    ImageRotateMode.Rotate180 -> IMAGE_ROTATE_180
++    ImageRotateMode.CounterClockwise90 -> IMAGE_ROTATE_270
++    ImageRotateMode.None -> IMAGE_ADJUST_OFF
++}
++
++private fun imageRotateForLabel(label: String): ImageRotateMode = when (label) {
++    IMAGE_ROTATE_90 -> ImageRotateMode.Clockwise90
++    IMAGE_ROTATE_180 -> ImageRotateMode.Rotate180
++    IMAGE_ROTATE_270 -> ImageRotateMode.CounterClockwise90
++    else -> ImageRotateMode.None
++}
++
++private fun imageFlipLabelFor(mode: ImageFlipMode): String = when (mode) {
++    ImageFlipMode.Horizontal -> IMAGE_FLIP_HORIZONTAL
++    ImageFlipMode.Vertical -> IMAGE_FLIP_VERTICAL
++    ImageFlipMode.Both -> IMAGE_FLIP_BOTH
++    ImageFlipMode.None -> IMAGE_ADJUST_OFF
++}
++
++private fun imageFlipForLabel(label: String): ImageFlipMode = when (label) {
++    IMAGE_FLIP_HORIZONTAL -> ImageFlipMode.Horizontal
++    IMAGE_FLIP_VERTICAL -> ImageFlipMode.Vertical
++    IMAGE_FLIP_BOTH -> ImageFlipMode.Both
++    else -> ImageFlipMode.None
++}
++
++private fun imageCropLabelFor(mode: ImageCropMode): String = when (mode) {
++    ImageCropMode.Square -> IMAGE_CROP_SQUARE
++    ImageCropMode.FourThree -> IMAGE_CROP_FOUR_THREE
++    ImageCropMode.ThreeFour -> IMAGE_CROP_THREE_FOUR
++    ImageCropMode.SixteenNine -> IMAGE_CROP_SIXTEEN_NINE
++    ImageCropMode.NineSixteen -> IMAGE_CROP_NINE_SIXTEEN
++    ImageCropMode.Circle -> IMAGE_CROP_CIRCLE
++    ImageCropMode.Off -> IMAGE_ADJUST_OFF
++}
++
++private fun imageCropForLabel(label: String): ImageCropMode = when (label) {
++    IMAGE_CROP_SQUARE -> ImageCropMode.Square
++    IMAGE_CROP_FOUR_THREE -> ImageCropMode.FourThree
++    IMAGE_CROP_THREE_FOUR -> ImageCropMode.ThreeFour
++    IMAGE_CROP_SIXTEEN_NINE -> ImageCropMode.SixteenNine
++    IMAGE_CROP_NINE_SIXTEEN -> ImageCropMode.NineSixteen
++    IMAGE_CROP_CIRCLE -> ImageCropMode.Circle
++    else -> ImageCropMode.Off
++}
++
++private fun imageColorLabelFor(mode: ImageColorMode): String = when (mode) {
++    ImageColorMode.Grayscale -> IMAGE_COLOR_GRAYSCALE
++    ImageColorMode.Inverted -> IMAGE_COLOR_INVERTED
++    ImageColorMode.Original -> IMAGE_COLOR_ORIGINAL
++}
++
++private fun imageColorForLabel(label: String): ImageColorMode = when (label) {
++    IMAGE_COLOR_GRAYSCALE -> ImageColorMode.Grayscale
++    IMAGE_COLOR_INVERTED -> ImageColorMode.Inverted
++    else -> ImageColorMode.Original
++}
++
++private fun imageBlurLabelFor(mode: ImageBlurMode): String = when (mode) {
++    ImageBlurMode.Light -> IMAGE_BLUR_LIGHT
++    ImageBlurMode.Standard -> IMAGE_BLUR_STANDARD
++    ImageBlurMode.Heavy -> IMAGE_BLUR_HEAVY
++    ImageBlurMode.Off -> IMAGE_ADJUST_OFF
++}
++
++private fun imageBlurForLabel(label: String): ImageBlurMode = when (label) {
++    IMAGE_BLUR_LIGHT -> ImageBlurMode.Light
++    IMAGE_BLUR_STANDARD -> ImageBlurMode.Standard
++    IMAGE_BLUR_HEAVY -> ImageBlurMode.Heavy
++    else -> ImageBlurMode.Off
++}
++
++private fun imageWatermarkPositionLabelFor(position: Int): String =
++    IMAGE_WATERMARK_POSITION_OPTIONS.getOrElse(position.coerceIn(1, 9) - 1) { IMAGE_WATERMARK_POSITION_OPTIONS[7] }
++
++private fun imageWatermarkPositionForLabel(label: String): Int =
++    (IMAGE_WATERMARK_POSITION_OPTIONS.indexOf(label).takeIf { it >= 0 } ?: 7) + 1
++
++@Composable
++private fun OptionTextField(
++    value: String,
++    label: String,
++    onValueChange: (String) -> Unit,
++    modifier: Modifier = Modifier
++) {
++    OutlinedTextField(
++        value = value,
++        onValueChange = { onValueChange(it.take(64)) },
++        singleLine = true,
++        label = { Text(label) },
++        colors = OutlinedTextFieldDefaults.colors(
++            focusedBorderColor = MaterialTheme.colorScheme.primary,
++            unfocusedBorderColor = MaterialTheme.colorScheme.outline,
++            focusedLabelColor = MaterialTheme.colorScheme.primary,
++            unfocusedLabelColor = MaterialTheme.colorScheme.onSurfaceVariant,
++            cursorColor = MaterialTheme.colorScheme.primary,
++            focusedContainerColor = MaterialTheme.colorScheme.surface,
++            unfocusedContainerColor = MaterialTheme.colorScheme.surface
++        ),
++        modifier = modifier.fillMaxWidth()
++    )
++}
++
++/**
++ * Resize, crop, rotate, flip, colour, blur and watermark for every image target.
++ * These run on device right before encoding, so they apply to whole batches.
++ */
++@Composable
++private fun ImageAdjustPanel(
++    texts: UiText,
++    menuPrefix: String,
++    edit: ImageEditOptions,
++    openMenuId: String?,
++    onOpenMenuChange: (String?) -> Unit,
++    onEditChange: (ImageEditOptions) -> Unit
++) {
++    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
++        OptionDropdown(
++            "${menuPrefix}img-resize",
++            "Resize",
++            imageResizeModeLabelFor(edit.resizeMode),
++            IMAGE_RESIZE_OPTIONS,
++            texts,
++            openMenuId,
++            onOpenMenuChange
++        ) { value -> onEditChange(edit.copy(resizeMode = imageResizeModeForLabel(value))) }
++
++        if (edit.resizeMode != ImageResizeMode.Off) {
++            OptionDropdown(
++                "${menuPrefix}img-unit",
++                "Unit",
++                imageSizeUnitLabelFor(edit.sizeUnit),
++                IMAGE_SIZE_UNIT_OPTIONS,
++                texts,
++                openMenuId,
++                onOpenMenuChange
++            ) { value -> onEditChange(edit.copy(sizeUnit = imageSizeUnitForLabel(value))) }
++
++            TrimSecondsField(
++                value = edit.resizeWidth.toDouble(),
++                label = if (edit.resizeMode == ImageResizeMode.Percent) "Percent" else "Width",
++                isError = false,
++                onValueChange = { onEditChange(edit.copy(resizeWidth = (it ?: 0.0).toFloat())) }
++            )
++            if (edit.resizeMode == ImageResizeMode.Exact) {
++                TrimSecondsField(
++                    value = edit.resizeHeight.toDouble(),
++                    label = "Height",
++                    isError = false,
++                    onValueChange = { onEditChange(edit.copy(resizeHeight = (it ?: 0.0).toFloat())) }
++                )
++                AdvancedSwitchRow(
++                    label = "Keep aspect ratio",
++                    checked = edit.keepAspect,
++                    onCheckedChange = { onEditChange(edit.copy(keepAspect = it)) }
++                )
++            }
++            if (edit.sizeUnit != ImageSizeUnit.Pixels) {
++                TrimSecondsField(
++                    value = edit.dpi.toDouble(),
++                    label = "DPI",
++                    isError = false,
++                    onValueChange = {
++                        onEditChange(edit.copy(dpi = (it ?: 300.0).toInt().coerceIn(36, ImageEditOptions.MAX_DPI)))
++                    }
++                )
++            }
++        }
++
++        OptionDropdown(
++            "${menuPrefix}img-rotate",
++            "Rotate",
++            imageRotateLabelFor(edit.rotate),
++            IMAGE_ROTATE_OPTIONS,
++            texts,
++            openMenuId,
++            onOpenMenuChange
++        ) { value -> onEditChange(edit.copy(rotate = imageRotateForLabel(value))) }
++
++        OptionDropdown(
++            "${menuPrefix}img-flip",
++            "Flip",
++            imageFlipLabelFor(edit.flip),
++            IMAGE_FLIP_OPTIONS,
++            texts,
++            openMenuId,
++            onOpenMenuChange
++        ) { value -> onEditChange(edit.copy(flip = imageFlipForLabel(value))) }
++
++        OptionDropdown(
++            "${menuPrefix}img-crop",
++            "Crop",
++            imageCropLabelFor(edit.crop),
++            IMAGE_CROP_OPTIONS,
++            texts,
++            openMenuId,
++            onOpenMenuChange
++        ) { value -> onEditChange(edit.copy(crop = imageCropForLabel(value))) }
++
++        OptionDropdown(
++            "${menuPrefix}img-color",
++            "Colour",
++            imageColorLabelFor(edit.colorMode),
++            IMAGE_COLOR_OPTIONS,
++            texts,
++            openMenuId,
++            onOpenMenuChange
++        ) { value -> onEditChange(edit.copy(colorMode = imageColorForLabel(value))) }
++
++        OptionDropdown(
++            "${menuPrefix}img-blur",
++            "Blur",
++            imageBlurLabelFor(edit.blur),
++            IMAGE_BLUR_OPTIONS,
++            texts,
++            openMenuId,
++            onOpenMenuChange
++        ) { value -> onEditChange(edit.copy(blur = imageBlurForLabel(value))) }
++
++        OptionTextField(
++            value = edit.watermarkText.orEmpty(),
++            label = "Watermark text",
++            onValueChange = { value -> onEditChange(edit.copy(watermarkText = value.ifBlank { null })) }
++        )
++
++        if (!edit.watermarkText.isNullOrBlank()) {
++            OptionDropdown(
++                "${menuPrefix}img-watermark-position",
++                "Watermark position",
++                imageWatermarkPositionLabelFor(edit.watermarkPosition),
++                IMAGE_WATERMARK_POSITION_OPTIONS,
++                texts,
++                openMenuId,
++                onOpenMenuChange
++            ) { value -> onEditChange(edit.copy(watermarkPosition = imageWatermarkPositionForLabel(value))) }
++
++            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
++                Text(
++                    text = stringResource(
++                        R.string.display_option_dropdown_1_s_2_s,
++                        "Opacity",
++                        "${edit.watermarkOpacity}%"
++                    ),
++                    style = MaterialTheme.typography.bodySmall,
++                    color = MaterialTheme.colorScheme.onSurfaceVariant
++                )
++                Slider(
++                    value = edit.watermarkOpacity.coerceIn(5, 100).toFloat(),
++                    onValueChange = { percent ->
++                        onEditChange(edit.copy(watermarkOpacity = Math.round(percent).toInt().coerceIn(5, 100)))
++                    },
++                    valueRange = 5f..100f,
++                    steps = 94,
++                    modifier = Modifier.fillMaxWidth()
++                )
++            }
++        }
++    }
++}
++
+ @Composable
+@@ -5833,3 +6437,9 @@ private fun ImageOptions(
+     onPdfPageModeChange: (String) -> Unit,
+-    onSuperResolutionChange: (String) -> Unit
++    onSuperResolutionChange: (String) -> Unit,
++    qualityPercent: Int = 85,
++    onQualityPercentChange: (Int) -> Unit = {},
++    editOptions: ImageEditOptions = ImageEditOptions(),
++    onEditOptionsChange: (ImageEditOptions) -> Unit = {},
++    targetSizeBytes: Long? = null,
++    onTargetSizeChange: (Long?) -> Unit = {}
+ ) {
+@@ -5921,2 +6531,227 @@ private fun ImageOptions(
+             )
++            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
++                Text(
++                    text = stringResource(R.string.display_option_dropdown_1_s_2_s, texts.quality, "$qualityPercent%"),
++                    style = MaterialTheme.typography.bodySmall,
++                    color = MaterialTheme.colorScheme.onSurfaceVariant
++                )
++                Slider(
++                    value = qualityPercent.coerceIn(1, 100).toFloat(),
++                    onValueChange = { percent ->
++                        onQualityPercentChange(Math.round(percent).toInt().coerceIn(1, 100))
++                    },
++                    valueRange = 1f..100f,
++                    steps = 98,
++                    modifier = Modifier.fillMaxWidth()
++                )
++            }
++        }
++
++        TargetSizeField(
++            valueBytes = targetSizeBytes,
++            label = texts.targetSize,
++            hint = texts.targetSizeHint(),
++            onValueChange = onTargetSizeChange
++        )
++
++        ImageAdjustPanel(
++            texts = texts,
++            menuPrefix = menuPrefix,
++            edit = editOptions,
++            openMenuId = openMenuId,
++            onOpenMenuChange = onOpenMenuChange,
++            onEditChange = onEditOptionsChange
++        )
++    }
++}
++
++private const val PDF_ROTATE_90 = "90\u00b0"
++private const val PDF_ROTATE_180 = "180\u00b0"
++private const val PDF_ROTATE_270 = "270\u00b0"
++private val PDF_ROTATE_OPTIONS = listOf(PDF_ROTATE_90, PDF_ROTATE_180, PDF_ROTATE_270)
++private const val PDF_ANGLE_0 = "0\u00b0"
++private const val PDF_ANGLE_45 = "45\u00b0"
++private const val PDF_ANGLE_90 = "90\u00b0"
++private val PDF_WATERMARK_ANGLE_OPTIONS = listOf(PDF_ANGLE_0, PDF_ANGLE_45, PDF_ANGLE_90)
++private const val PDF_POSITION_BOTTOM_CENTRE = "Bottom centre"
++private const val PDF_POSITION_BOTTOM_LEFT = "Bottom left"
++private const val PDF_POSITION_BOTTOM_RIGHT = "Bottom right"
++private const val PDF_POSITION_TOP_CENTRE = "Top centre"
++private const val PDF_POSITION_TOP_LEFT = "Top left"
++private const val PDF_POSITION_TOP_RIGHT = "Top right"
++private val PDF_PAGE_NUMBER_POSITION_OPTIONS = listOf(
++    PDF_POSITION_BOTTOM_CENTRE,
++    PDF_POSITION_BOTTOM_LEFT,
++    PDF_POSITION_BOTTOM_RIGHT,
++    PDF_POSITION_TOP_CENTRE,
++    PDF_POSITION_TOP_LEFT,
++    PDF_POSITION_TOP_RIGHT
++)
++
++private fun pdfRotateLabelFor(degrees: Int): String = when (degrees) {
++    180 -> PDF_ROTATE_180
++    270 -> PDF_ROTATE_270
++    else -> PDF_ROTATE_90
++}
++
++private fun pdfRotateForLabel(label: String): Int = when (label) {
++    PDF_ROTATE_180 -> 180
++    PDF_ROTATE_270 -> 270
++    else -> 90
++}
++
++private fun pdfWatermarkAngleLabelFor(degrees: Int): String = when (degrees) {
++    0 -> PDF_ANGLE_0
++    90 -> PDF_ANGLE_90
++    else -> PDF_ANGLE_45
++}
++
++private fun pdfWatermarkAngleForLabel(label: String): Int = when (label) {
++    PDF_ANGLE_0 -> 0
++    PDF_ANGLE_90 -> 90
++    else -> 45
++}
++
++private fun pdfPageNumberPositionLabelFor(position: PdfPageNumberPosition): String = when (position) {
++    PdfPageNumberPosition.BottomCentre -> PDF_POSITION_BOTTOM_CENTRE
++    PdfPageNumberPosition.BottomLeft -> PDF_POSITION_BOTTOM_LEFT
++    PdfPageNumberPosition.BottomRight -> PDF_POSITION_BOTTOM_RIGHT
++    PdfPageNumberPosition.TopCentre -> PDF_POSITION_TOP_CENTRE
++    PdfPageNumberPosition.TopLeft -> PDF_POSITION_TOP_LEFT
++    PdfPageNumberPosition.TopRight -> PDF_POSITION_TOP_RIGHT
++}
++
++private fun pdfPageNumberPositionForLabel(label: String): PdfPageNumberPosition = when (label) {
++    PDF_POSITION_BOTTOM_LEFT -> PdfPageNumberPosition.BottomLeft
++    PDF_POSITION_BOTTOM_RIGHT -> PdfPageNumberPosition.BottomRight
++    PDF_POSITION_TOP_CENTRE -> PdfPageNumberPosition.TopCentre
++    PDF_POSITION_TOP_LEFT -> PdfPageNumberPosition.TopLeft
++    PDF_POSITION_TOP_RIGHT -> PdfPageNumberPosition.TopRight
++    else -> PdfPageNumberPosition.BottomCentre
++}
++
++private fun isPdfToolTarget(targetId: TargetId): Boolean = when (targetId) {
++    TargetId.PdfRotate,
++    TargetId.PdfOrganize,
++    TargetId.PdfPageNumbers,
++    TargetId.PdfWatermark,
++    TargetId.PdfCrop -> true
++    else -> false
++}
++
++/** Options for the offline PDF tools: rotate, organise, page numbers, watermark, crop. */
++@Composable
++private fun PdfToolPanel(
++    texts: UiText,
++    menuPrefix: String,
++    targetId: TargetId,
++    tool: PdfToolOptions,
++    openMenuId: String?,
++    onOpenMenuChange: (String?) -> Unit,
++    onToolChange: (PdfToolOptions) -> Unit
++) {
++    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
++        when (targetId) {
++            TargetId.PdfRotate -> OptionDropdown(
++                "${menuPrefix}pdf-rotate",
++                "Rotate by",
++                pdfRotateLabelFor(tool.rotateDegrees),
++                PDF_ROTATE_OPTIONS,
++                texts,
++                openMenuId,
++                onOpenMenuChange
++            ) { value -> onToolChange(tool.copy(rotateDegrees = pdfRotateForLabel(value))) }
++
++            TargetId.PdfOrganize -> {
++                OptionTextField(
++                    value = tool.pageOrder,
++                    label = "Page order",
++                    onValueChange = { value -> onToolChange(tool.copy(pageOrder = value)) }
++                )
++                Text(
++                    text = "List the pages to keep, in order, like 1,3,5-7. A page you leave out is dropped.",
++                    style = MaterialTheme.typography.bodySmall,
++                    color = MaterialTheme.colorScheme.onSurfaceVariant,
++                    maxLines = 3,
++                    overflow = TextOverflow.Ellipsis
++                )
++            }
++
++            TargetId.PdfPageNumbers -> {
++                OptionDropdown(
++                    "${menuPrefix}pdf-page-number-position",
++                    "Position",
++                    pdfPageNumberPositionLabelFor(tool.pageNumberPosition),
++                    PDF_PAGE_NUMBER_POSITION_OPTIONS,
++                    texts,
++                    openMenuId,
++                    onOpenMenuChange
++                ) { value -> onToolChange(tool.copy(pageNumberPosition = pdfPageNumberPositionForLabel(value))) }
++                TrimSecondsField(
++                    value = tool.pageNumberStart.toDouble(),
++                    label = "Start at",
++                    isError = false,
++                    onValueChange = { onToolChange(tool.copy(pageNumberStart = (it ?: 1.0).toInt().coerceAtLeast(1))) }
++                )
++            }
++
++            TargetId.PdfWatermark -> {
++                OptionTextField(
++                    value = tool.watermarkText.orEmpty(),
++                    label = "Watermark text",
++                    onValueChange = { value -> onToolChange(tool.copy(watermarkText = value.ifBlank { null })) }
++                )
++                OptionDropdown(
++                    "${menuPrefix}pdf-watermark-angle",
++                    "Angle",
++                    pdfWatermarkAngleLabelFor(tool.watermarkRotation),
++                    PDF_WATERMARK_ANGLE_OPTIONS,
++                    texts,
++                    openMenuId,
++                    onOpenMenuChange
++                ) { value -> onToolChange(tool.copy(watermarkRotation = pdfWatermarkAngleForLabel(value))) }
++                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
++                    Text(
++                        text = stringResource(
++                            R.string.display_option_dropdown_1_s_2_s,
++                            "Opacity",
++                            "${tool.watermarkOpacity}%"
++                        ),
++                        style = MaterialTheme.typography.bodySmall,
++                        color = MaterialTheme.colorScheme.onSurfaceVariant
++                    )
++                    Slider(
++                        value = tool.watermarkOpacity.coerceIn(5, 100).toFloat(),
++                        onValueChange = { percent ->
++                            onToolChange(tool.copy(watermarkOpacity = Math.round(percent).toInt().coerceIn(5, 100)))
++                        },
++                        valueRange = 5f..100f,
++                        steps = 94,
++                        modifier = Modifier.fillMaxWidth()
++                    )
++                }
++            }
++
++            TargetId.PdfCrop -> Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
++                Text(
++                    text = stringResource(
++                        R.string.display_option_dropdown_1_s_2_s,
++                        "Crop margin",
++                        "${tool.cropMarginPercent}%"
++                    ),
++                    style = MaterialTheme.typography.bodySmall,
++                    color = MaterialTheme.colorScheme.onSurfaceVariant
++                )
++                Slider(
++                    value = tool.cropMarginPercent.coerceIn(0, 40).toFloat(),
++                    onValueChange = { percent ->
++                        onToolChange(tool.copy(cropMarginPercent = Math.round(percent).toInt().coerceIn(0, 40)))
++                    },
++                    valueRange = 0f..40f,
++                    steps = 39,
++                    modifier = Modifier.fillMaxWidth()
++                )
++            }
++
++            else -> Unit
+         }
+@@ -5935,3 +6770,5 @@ private fun PdfOptions(
+     onRenderQualityChange: (String) -> Unit = {},
+-    onCompressionPresetChange: (String) -> Unit = {}
++    onCompressionPresetChange: (String) -> Unit = {},
++    pdfToolOptions: PdfToolOptions = PdfToolOptions(),
++    onPdfToolOptionsChange: (PdfToolOptions) -> Unit = {}
+ ) {
+@@ -5953,2 +6790,17 @@ private fun PdfOptions(
+ 
++    if (isPdfToolTarget(targetFormat.id)) {
++        OptionGrid {
++            PdfToolPanel(
++                texts = texts,
++                menuPrefix = menuPrefix,
++                targetId = targetFormat.id,
++                tool = pdfToolOptions,
++                openMenuId = openMenuId,
++                onOpenMenuChange = onOpenMenuChange,
++                onToolChange = onPdfToolOptionsChange
++            )
++        }
++        return
++    }
++
+     if (
+@@ -6092,17 +6944,15 @@ private fun QueueActions(
+         modifier = Modifier.fillMaxWidth(),
+-        horizontalArrangement = Arrangement.spacedBy(10.dp)
++        verticalAlignment = Alignment.CenterVertically,
++        horizontalArrangement = Arrangement.spacedBy(8.dp)
+     ) {
+-        OutlinedButton(
+-            onClick = onCancel,
+-            modifier = Modifier.weight(1f)
+-        ) {
+-            AppIcon(
+-                icon = Icons.Rounded.Close,
+-                contentDescription = null,
+-                tint = MaterialTheme.colorScheme.primary,
+-                modifier = Modifier.size(17.dp)
+-            )
+-            Spacer(modifier = Modifier.width(7.dp))
+-            Text(texts.cancelOrClearTasks)
+-        }
++        Text(
++            text = texts.cancelOrClearTasks,
++            style = MaterialTheme.typography.labelLarge,
++            color = MaterialTheme.colorScheme.onSurfaceVariant,
++            modifier = Modifier
++                .clip(RoundedCornerShape(12.dp))
++                .clickable(enabled = !isRunning) { onCancel() }
++                .padding(horizontal = 12.dp, vertical = 14.dp)
++        )
++        val startShape = RoundedCornerShape(28.dp)
+         Button(
+@@ -6110,3 +6960,13 @@ private fun QueueActions(
+             enabled = !isRunning,
+-            modifier = Modifier.weight(1f)
++            shape = startShape,
++            colors = ButtonDefaults.buttonColors(
++                containerColor = if (isRunning) MaterialTheme.colorScheme.surfaceVariant else Color.Transparent,
++                contentColor = if (isRunning) MaterialTheme.colorScheme.onSurfaceVariant else SpectrumOnColor,
++                disabledContainerColor = MaterialTheme.colorScheme.surfaceVariant,
++                disabledContentColor = MaterialTheme.colorScheme.onSurfaceVariant
++            ),
++            modifier = Modifier
++                .weight(1f)
++                .heightIn(min = 56.dp)
++                .then(if (isRunning) Modifier else Modifier.background(SpectrumBrush, startShape))
+         ) {
+@@ -6115,3 +6975,3 @@ private fun QueueActions(
+                 contentDescription = null,
+-                tint = MaterialTheme.colorScheme.onPrimary,
++                tint = if (isRunning) MaterialTheme.colorScheme.onSurfaceVariant else SpectrumOnColor,
+                 modifier = Modifier.size(18.dp)
+@@ -6380,3 +7240,4 @@ private fun QueuedFileOptionsPanel(
+         when (file.category) {
+-            FileCategory.Video -> VideoOptions(
++            FileCategory.Video -> Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
++            VideoOptions(
+                 texts = texts,
+@@ -6569,3 +7430,13 @@ private fun QueuedFileOptionsPanel(
+             )
+-            FileCategory.Audio -> AudioOptions(
++            TargetSizeField(
++                valueBytes = file.videoOptions.targetSizeBytes,
++                label = texts.targetSize,
++                hint = texts.targetSizeHint(),
++                onValueChange = { bytes ->
++                    onUpdateFile(file.copy(videoOptions = file.videoOptions.copy(targetSizeBytes = bytes)))
++                }
++            )
++            }
++            FileCategory.Audio -> Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
++            AudioOptions(
+                 texts = texts,
+@@ -6645,3 +7516,12 @@ private fun QueuedFileOptionsPanel(
+             )
+-            FileCategory.Image -> {
++            TargetSizeField(
++                valueBytes = file.audioOptions.targetSizeBytes,
++                label = texts.targetSize,
++                hint = texts.targetSizeHint(),
++                onValueChange = { bytes ->
++                    onUpdateFile(file.copy(audioOptions = file.audioOptions.copy(targetSizeBytes = bytes)))
++                }
++            )
++            }
++            FileCategory.Image -> Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                 ImageOptions(
+@@ -6657,3 +7537,15 @@ private fun QueuedFileOptionsPanel(
+                     onQualityChange = { value ->
+-                        onUpdateFile(file.copy(imageOptions = imageOptionsForQuality(value, selectedTarget.targetFormat)))
++                        onUpdateFile(file.copy(imageOptions = imageOptionsForQuality(value, selectedTarget.targetFormat, file.imageOptions)))
++                    },
++                    qualityPercent = file.imageOptions.quality,
++                    onQualityPercentChange = { percent ->
++                        onUpdateFile(file.copy(imageOptions = file.imageOptions.copy(quality = percent)))
++                    },
++                    editOptions = file.imageOptions.edit,
++                    onEditOptionsChange = { edit ->
++                        onUpdateFile(file.copy(imageOptions = file.imageOptions.copy(edit = edit)))
++                    },
++                    targetSizeBytes = file.imageOptions.targetSizeBytes,
++                    onTargetSizeChange = { bytes ->
++                        onUpdateFile(file.copy(imageOptions = file.imageOptions.copy(targetSizeBytes = bytes)))
+                     },
+@@ -6706,2 +7598,6 @@ private fun QueuedFileOptionsPanel(
+                     onUpdateFile(file.copy(pdfOptions = file.pdfOptions.copy(compressionPreset = pdfCompressionPresetToOption(value))))
++                },
++                pdfToolOptions = file.pdfOptions.tool,
++                onPdfToolOptionsChange = { tool ->
++                    onUpdateFile(file.copy(pdfOptions = file.pdfOptions.copy(tool = tool)))
+                 }
+@@ -6754,2 +7650,92 @@ private fun GifImageOptions(
+ 
++private const val TARGET_SIZE_KB = "KB"
++private const val TARGET_SIZE_MB = "MB"
++private const val TARGET_SIZE_BYTES_PER_KB = 1024L
++private const val TARGET_SIZE_BYTES_PER_MB = 1024L * 1024L
++
++private fun targetSizeTextFor(bytes: Long?): String {
++    if (bytes == null || bytes <= 0L) return ""
++    return if (bytes >= TARGET_SIZE_BYTES_PER_MB) {
++        val megabytes = bytes.toDouble() / TARGET_SIZE_BYTES_PER_MB.toDouble()
++        "${formatTargetSizeNumber(megabytes)} $TARGET_SIZE_MB"
++    } else {
++        val kilobytes = bytes.toDouble() / TARGET_SIZE_BYTES_PER_KB.toDouble()
++        "${formatTargetSizeNumber(kilobytes)} $TARGET_SIZE_KB"
++    }
++}
++
++private fun formatTargetSizeNumber(value: Double): String {
++    if (value == value.toLong().toDouble()) return value.toLong().toString()
++    return java.math.BigDecimal(value)
++        .setScale(2, java.math.RoundingMode.HALF_UP)
++        .stripTrailingZeros()
++        .toPlainString()
++}
++
++private fun parseTargetSizeInput(raw: String): Long? {
++    val trimmed = raw.trim()
++    if (trimmed.isEmpty()) return null
++    val lower = trimmed.lowercase(Locale.US)
++    val multiplier = when {
++        lower.endsWith("mb") -> TARGET_SIZE_BYTES_PER_MB
++        lower.endsWith("kb") -> TARGET_SIZE_BYTES_PER_KB
++        else -> TARGET_SIZE_BYTES_PER_KB
++    }
++    val numberText = lower.removeSuffix("mb").removeSuffix("kb").trim()
++    val number = numberText.toDoubleOrNull() ?: return null
++    if (number <= 0.0) return null
++    return (number * multiplier.toDouble()).toLong().takeIf { it > 0L }
++}
++
++@Composable
++private fun TargetSizeField(
++    valueBytes: Long?,
++    label: String,
++    hint: String,
++    onValueChange: (Long?) -> Unit,
++    modifier: Modifier = Modifier
++) {
++    var text by remember { mutableStateOf(targetSizeTextFor(valueBytes)) }
++    var focused by remember { mutableStateOf(false) }
++    LaunchedEffect(valueBytes) {
++        if (!focused) text = targetSizeTextFor(valueBytes)
++    }
++    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
++        OutlinedTextField(
++            value = text,
++            onValueChange = { rawValue ->
++                val cleaned = rawValue.take(16)
++                text = cleaned
++                onValueChange(if (cleaned.isBlank()) null else parseTargetSizeInput(cleaned))
++            },
++            singleLine = true,
++            label = { Text(label) },
++            placeholder = { Text("0") },
++            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
++            colors = OutlinedTextFieldDefaults.colors(
++                focusedBorderColor = MaterialTheme.colorScheme.primary,
++                unfocusedBorderColor = MaterialTheme.colorScheme.outline,
++                focusedLabelColor = MaterialTheme.colorScheme.primary,
++                unfocusedLabelColor = MaterialTheme.colorScheme.onSurfaceVariant,
++                cursorColor = MaterialTheme.colorScheme.primary,
++                focusedContainerColor = MaterialTheme.colorScheme.surface,
++                unfocusedContainerColor = MaterialTheme.colorScheme.surface
++            ),
++            modifier = modifier
++                .fillMaxWidth()
++                .onFocusChanged { focusState ->
++                    if (focused && !focusState.isFocused) text = targetSizeTextFor(valueBytes)
++                    focused = focusState.isFocused
++                }
++        )
++        Text(
++            text = hint,
++            style = MaterialTheme.typography.bodySmall,
++            color = MaterialTheme.colorScheme.onSurfaceVariant,
++            maxLines = 2,
++            overflow = TextOverflow.Ellipsis
++        )
++    }
++}
++
+ @Composable
+@@ -7060,2 +8046,37 @@ internal fun FileCategory.icon(): ImageVector {
+ 
++// Sarvam's identity is a continuous blue-to-orange spectrum. We keep colour still
++// everywhere except the single primary action, where the spectrum carries motion.
++private val SpectrumBrush = Brush.horizontalGradient(
++    listOf(Color(0xFF2F6BE8), Color(0xFF8B5CF6), Color(0xFFFF8A3D))
++)
++private val SpectrumOnColor = Color(0xFFFFFDF8)
++
++/**
++ * Anthropic sets display copy in a serif against sans body copy. Android ships
++ * Noto Serif as [FontFamily.Serif], so the editorial character costs nothing.
++ * Headings take the serif; body and labels stay sans for dense utility legibility.
++ */
++private fun zenConverterTypography(): Typography {
++    val base = Typography()
++    return Typography(
++        displayLarge = base.displayLarge.copy(fontFamily = FontFamily.Serif, fontWeight = FontWeight.Normal),
++        displayMedium = base.displayMedium.copy(fontFamily = FontFamily.Serif, fontWeight = FontWeight.Normal),
++        displaySmall = base.displaySmall.copy(fontFamily = FontFamily.Serif, fontWeight = FontWeight.Normal),
++        headlineLarge = base.headlineLarge.copy(fontFamily = FontFamily.Serif, fontWeight = FontWeight.Normal),
++        headlineMedium = base.headlineMedium.copy(fontFamily = FontFamily.Serif, fontWeight = FontWeight.Normal),
++        headlineSmall = base.headlineSmall.copy(fontFamily = FontFamily.Serif, fontWeight = FontWeight.Normal),
++        titleLarge = base.titleLarge.copy(fontFamily = FontFamily.Serif, fontWeight = FontWeight.Medium),
++        titleMedium = base.titleMedium.copy(fontWeight = FontWeight.Medium),
++        labelLarge = base.labelLarge.copy(fontWeight = FontWeight.Medium, letterSpacing = 0.2.sp)
++    )
++}
++
++private fun zenConverterShapes(): Shapes = Shapes(
++    extraSmall = RoundedCornerShape(6.dp),
++    small = RoundedCornerShape(10.dp),
++    medium = RoundedCornerShape(14.dp),
++    large = RoundedCornerShape(20.dp),
++    extraLarge = RoundedCornerShape(28.dp)
++)
++
+ private fun zenConverterColorScheme(
+@@ -7094,2 +8115,12 @@ private fun zenConverterColorScheme(
+ 
++    // Anthropic's canvas is warm paper, never pure white, and its ink is a warm
++    // near-black. Those two decisions carry most of the brand.
++    val ink = Color(0xFF141413)
++    val paper = Color(0xFFFAF9F5)
++    val ivoryMedium = Color(0xFFF0EEE6)
++    val ivoryDark = Color(0xFFE8E6DC)
++    val slateLight = Color(0xFF5E5D59)
++    val cloudMedium = Color(0xFFB0AEA5)
++    val warmText = Color(0xFFF5F3EC)
++
+     return if (!isDark) {
+@@ -7098,14 +8129,25 @@ private fun zenConverterColorScheme(
+             onPrimary = onPrimary,
++            primaryContainer = ivoryMedium,
++            onPrimaryContainer = ink,
+             secondary = primary,
+             onSecondary = onPrimary,
+-            background = Color.White,
+-            onBackground = Color(0xFF111111),
+-            surface = Color.White,
+-            onSurface = Color(0xFF111111),
+-            surfaceVariant = Color(0xFFF6F6F6),
+-            onSurfaceVariant = Color(0xFF666666),
+-            outline = Color(0xFFD8D8D8),
+-            outlineVariant = Color(0xFFEBEBEB),
+-            error = Color(0xFFB3261E),
+-            onError = Color.White
++            secondaryContainer = ivoryDark,
++            onSecondaryContainer = ink,
++            background = paper,
++            onBackground = ink,
++            surface = paper,
++            onSurface = ink,
++            surfaceVariant = ivoryMedium,
++            onSurfaceVariant = slateLight,
++            surfaceContainerLowest = Color(0xFFFFFFFF),
++            surfaceContainerLow = Color(0xFFFDFCF8),
++            surfaceContainer = Color(0xFFF6F4EE),
++            surfaceContainerHigh = Color(0xFFF0EEE6),
++            surfaceContainerHighest = Color(0xFFE9E7DE),
++            outline = Color(0xFFD3D0C4),
++            outlineVariant = ivoryDark,
++            inverseSurface = ink,
++            inverseOnSurface = paper,
++            error = Color(0xFF9E3B2F),
++            onError = Color(0xFFFFF8F5)
+         )
+@@ -7115,14 +8157,25 @@ private fun zenConverterColorScheme(
+             onPrimary = onPrimary,
++            primaryContainer = Color(0xFF2A2A26),
++            onPrimaryContainer = warmText,
+             secondary = primary,
+             onSecondary = onPrimary,
++            secondaryContainer = Color(0xFF232320),
++            onSecondaryContainer = warmText,
+             background = Color(0xFF000000),
+-            onBackground = Color(0xFFF5F5F5),
++            onBackground = warmText,
+             surface = Color(0xFF000000),
+-            onSurface = Color(0xFFF5F5F5),
+-            surfaceVariant = Color(0xFF141414),
+-            onSurfaceVariant = Color(0xFFA3A3A3),
+-            outline = Color(0xFF282828),
+-            outlineVariant = Color(0xFF1C1C1C),
+-            error = Color(0xFFCF6679),
+-            onError = Color(0xFF1E0005)
++            onSurface = warmText,
++            surfaceVariant = Color(0xFF1A1A17),
++            onSurfaceVariant = cloudMedium,
++            surfaceContainerLowest = Color(0xFF000000),
++            surfaceContainerLow = Color(0xFF0C0C0B),
++            surfaceContainer = Color(0xFF131311),
++            surfaceContainerHigh = Color(0xFF1A1A17),
++            surfaceContainerHighest = Color(0xFF22221E),
++            outline = Color(0xFF3A3A35),
++            outlineVariant = Color(0xFF262622),
++            inverseSurface = warmText,
++            inverseOnSurface = ink,
++            error = Color(0xFFD98A7C),
++            onError = Color(0xFF2A0C06)
+         )
+@@ -7132,14 +8185,25 @@ private fun zenConverterColorScheme(
+             onPrimary = onPrimary,
++            primaryContainer = Color(0xFF3A3A34),
++            onPrimaryContainer = warmText,
+             secondary = primary,
+             onSecondary = onPrimary,
+-            background = Color(0xFF16181D),
+-            onBackground = Color(0xFFF3F4F6),
+-            surface = Color(0xFF1E222A),
+-            onSurface = Color(0xFFF3F4F6),
+-            surfaceVariant = Color(0xFF262B35),
+-            onSurfaceVariant = Color(0xFF9CA3AF),
+-            outline = Color(0xFF374151),
+-            outlineVariant = Color(0xFF2B3240),
+-            error = Color(0xFFEF4444),
+-            onError = Color.White
++            secondaryContainer = Color(0xFF2E2E2A),
++            onSecondaryContainer = warmText,
++            background = ink,
++            onBackground = warmText,
++            surface = Color(0xFF1A1A18),
++            onSurface = warmText,
++            surfaceVariant = Color(0xFF262623),
++            onSurfaceVariant = cloudMedium,
++            surfaceContainerLowest = Color(0xFF0F0F0E),
++            surfaceContainerLow = Color(0xFF171716),
++            surfaceContainer = Color(0xFF1D1D1B),
++            surfaceContainerHigh = Color(0xFF242421),
++            surfaceContainerHighest = Color(0xFF2C2C28),
++            outline = Color(0xFF45453F),
++            outlineVariant = Color(0xFF2C2C28),
++            inverseSurface = warmText,
++            inverseOnSurface = ink,
++            error = Color(0xFFE0907F),
++            onError = Color(0xFF2A0C06)
+         )
+@@ -7608,3 +8672,4 @@ private fun imageOptionsForQuality(
+     value: String,
+-    targetFormat: TargetFormat
++    targetFormat: TargetFormat,
++    current: ImageExportOptions? = null
+ ): ImageExportOptions {
+@@ -7613,3 +8678,5 @@ private fun imageOptionsForQuality(
+         webpLossless = supportsWebpLosslessQuality(targetFormat) &&
+-            value == IMAGE_QUALITY_LOSSLESS
++            value == IMAGE_QUALITY_LOSSLESS,
++        superResolution = current?.superResolution ?: ImageSuperResolutionMode.Off,
++        targetSizeBytes = current?.targetSizeBytes
+     )
+diff --git a/app/src/main/res/values-b+zh+Hans/strings.xml b/app/src/main/res/values-b+zh+Hans/strings.xml
+index 5345de4..2eca0bd 100644
+--- a/app/src/main/res/values-b+zh+Hans/strings.xml
++++ b/app/src/main/res/values-b+zh+Hans/strings.xml
+@@ -69,3 +69,3 @@
+     <string name="help_subtitle_title">字幕与歌词</string>
+-    <string name="help_title">ZenConverter 能做什么</string>
++    <string name="help_title">Format Setu 能做什么</string>
+     <string name="help_video_body">转换常见视频格式，支持 AI 2× 深度学习视频插帧（实验性）、多视频拼接合并、时间轴裁剪与多段分割，也可提取音频。</string>
+@@ -160,3 +160,3 @@
+     <string name="privacy_for_privacy_questions_use_the_current_contact_method_listed_on_the_project_or_distribution_page_do_not_attach_files_passwords_or_sensitive_metadata_to_a">如有隐私问题，请使用项目页或应用分发页列出的当前联系方式。不要在公开反馈中附上文件、密码或敏感元数据。</string>
+-    <string name="privacy_intro_zenconverter_processes_files_on_your_device_files">ZenConverter 在设备上处理文件。你选择的文件、文件内容和 PDF 密码不会上传到开发者控制的服务器。应用没有账号、广告、使用行为分析或崩溃上报。</string>
++    <string name="privacy_intro_zenconverter_processes_files_on_your_device_files">Format Setu 在设备上处理文件。你选择的文件、文件内容和 PDF 密码不会上传到开发者控制的服务器。应用没有账号、广告、使用行为分析或崩溃上报。</string>
+     <string name="privacy_language_accent_color_whether_a_custom_output_location_is_used_and_the_selected_folder_s_uri_and_display_name_are_stored_in_private_app_settings_you_man">语言、主题色、是否使用自定义输出位置，以及所选文件夹的 URI 和显示名称，会保存在应用私有设置中。源文件和转换结果由你在文件系统中管理；清除应用数据不会删除共享目录里的文件。</string>
+@@ -377,3 +377,3 @@
+     <string name="text_rotation_label">旋转</string>
+-    <string name="text_running_keep_awake_message">%1$s · 已保持屏幕常亮，请让 ZenConverter 留在前台</string>
++    <string name="text_running_keep_awake_message">%1$s · 已保持屏幕常亮，请让 Format Setu 留在前台</string>
+     <string name="text_super_resolution_summary">双线性放大 · 原图质量</string>
+@@ -487,3 +487,3 @@
+     <string name="ui_app_download">App 内下载</string>
+-    <string name="ui_app_logo">ZenConverter 标志</string>
++    <string name="ui_app_logo">Format Setu 标志</string>
+     <string name="ui_app_version">版本</string>
+@@ -521,3 +521,3 @@
+     <string name="ui_default_output_location">默认文件夹</string>
+-    <string name="ui_default_output_note">系统文件夹 / ZenConverter</string>
++    <string name="ui_default_output_note">系统文件夹 / Format Setu</string>
+     <string name="ui_download_cancelled">下载已取消</string>
+@@ -602,5 +602,5 @@
+     <string name="ui_skip">跳过</string>
+-    <string name="ui_sponsor_intro">赞助以支持 ZenConverter 始终保持维护，坚持开源免费无广告</string>
++    <string name="ui_sponsor_intro">赞助以支持 Format Setu 始终保持维护，坚持开源免费无广告</string>
+     <string name="ui_sponsor_no_benefits">赞助不会带来任何额外服务或功能。</string>
+-    <string name="ui_sponsor_title">赞助 ZenConverter</string>
++    <string name="ui_sponsor_title">赞助 Format Setu</string>
+     <string name="ui_stable_update_channel">正式版</string>
+diff --git a/app/src/main/res/values-b+zh+Hant/strings.xml b/app/src/main/res/values-b+zh+Hant/strings.xml
+index 718026e..9021654 100644
+--- a/app/src/main/res/values-b+zh+Hant/strings.xml
++++ b/app/src/main/res/values-b+zh+Hant/strings.xml
+@@ -69,3 +69,3 @@
+     <string name="help_subtitle_title">字幕與歌詞</string>
+-    <string name="help_title">ZenConverter 可以做什麼</string>
++    <string name="help_title">Format Setu 可以做什麼</string>
+     <string name="help_video_body">轉換常見影片格式，支援 AI 2× 深度學習影片補幀（實驗性）、多影片拼接合併、時間軸裁剪與多段分割，也可擷取音訊。</string>
+@@ -160,3 +160,3 @@
+     <string name="privacy_for_privacy_questions_use_the_current_contact_method_listed_on_the_project_or_distribution_page_do_not_attach_files_passwords_or_sensitive_metadata_to_a">如有隱私問題，請使用專案頁面或應用程式發行頁面列出的目前聯絡方式。請勿在公開回報中附上檔案、密碼或敏感中繼資料。</string>
+-    <string name="privacy_intro_zenconverter_processes_files_on_your_device_files">ZenConverter 在裝置上處理檔案。你選取的檔案、檔案內容和 PDF 密碼不會傳送到開發者控制的伺服器。應用程式沒有帳戶、廣告、使用行為分析或當機回報。</string>
++    <string name="privacy_intro_zenconverter_processes_files_on_your_device_files">Format Setu 在裝置上處理檔案。你選取的檔案、檔案內容和 PDF 密碼不會傳送到開發者控制的伺服器。應用程式沒有帳戶、廣告、使用行為分析或當機回報。</string>
+     <string name="privacy_language_accent_color_whether_a_custom_output_location_is_used_and_the_selected_folder_s_uri_and_display_name_are_stored_in_private_app_settings_you_man">語言、主題色、是否使用自訂輸出位置，以及所選資料夾的 URI 和顯示名稱，會存放在應用程式私有設定中。來源檔案和轉換結果由你在檔案系統中管理；清除應用程式資料不會刪除共享目錄內的檔案。</string>
+@@ -377,3 +377,3 @@
+     <string name="text_rotation_label">旋轉</string>
+-    <string name="text_running_keep_awake_message">%1$s · 已保持螢幕常亮，請讓 ZenConverter 留在前台</string>
++    <string name="text_running_keep_awake_message">%1$s · 已保持螢幕常亮，請讓 Format Setu 留在前台</string>
+     <string name="text_super_resolution_summary">雙線性放大 · 原圖品質</string>
+@@ -487,3 +487,3 @@
+     <string name="ui_app_download">App 內下載</string>
+-    <string name="ui_app_logo">ZenConverter 標誌</string>
++    <string name="ui_app_logo">Format Setu 標誌</string>
+     <string name="ui_app_version">版本</string>
+@@ -521,3 +521,3 @@
+     <string name="ui_default_output_location">預設資料夾</string>
+-    <string name="ui_default_output_note">系統資料夾 / ZenConverter</string>
++    <string name="ui_default_output_note">系統資料夾 / Format Setu</string>
+     <string name="ui_download_cancelled">下載已取消</string>
+@@ -602,5 +602,5 @@
+     <string name="ui_skip">略過</string>
+-    <string name="ui_sponsor_intro">贊助以支持 ZenConverter 始終保持維護，堅持開源免費無廣告</string>
++    <string name="ui_sponsor_intro">贊助以支持 Format Setu 始終保持維護，堅持開源免費無廣告</string>
+     <string name="ui_sponsor_no_benefits">贊助不會帶來任何額外服務或功能。</string>
+-    <string name="ui_sponsor_title">贊助 ZenConverter</string>
++    <string name="ui_sponsor_title">贊助 Format Setu</string>
+     <string name="ui_stable_update_channel">正式版</string>
+diff --git a/app/src/main/res/values-fr/strings.xml b/app/src/main/res/values-fr/strings.xml
+index bc37648..506dfc6 100644
+--- a/app/src/main/res/values-fr/strings.xml
++++ b/app/src/main/res/values-fr/strings.xml
+@@ -77,3 +77,3 @@
+     <string name="help_subtitle_title">Sous-titres et paroles</string>
+-    <string name="help_title">Ce que ZenConverter peut faire</string>
++    <string name="help_title">Ce que Format Setu peut faire</string>
+     <string name="help_video_body">Convertir les formats vidéo courants, utiliser l\'interpolation de fréquence d\'images 2× par IA (fonctionnalité expérimentale), fusionner plusieurs vidéos, découper et scinder des segments, ou extraire des pistes audio.</string>
+@@ -169,3 +169,3 @@
+     <string name="privacy_for_privacy_questions_use_the_current_contact_method_listed_on_the_project_or_distribution_page_do_not_attach_files_passwords_or_sensitive_metadata_to_a">Pour toute question relative à la confidentialité, veuillez utiliser les coordonnées indiquées sur la page du projet ou de la distribution. Ne joignez pas de fichiers, de mots de passe ou de métadonnées sensibles à un rapport public.</string>
+-    <string name="privacy_intro_zenconverter_processes_files_on_your_device_files">ZenConverter traite les fichiers directement sur votre appareil. Les fichiers que vous sélectionnez, leur contenu et les mots de passe des fichiers PDF ne sont pas transférés vers des serveurs contrôlés par le développeur. L\'application ne comporte ni système de compte, ni publicités, ni analyse d\'utilisation, ni rapport d\'erreurs.</string>
++    <string name="privacy_intro_zenconverter_processes_files_on_your_device_files">Format Setu traite les fichiers directement sur votre appareil. Les fichiers que vous sélectionnez, leur contenu et les mots de passe des fichiers PDF ne sont pas transférés vers des serveurs contrôlés par le développeur. L\'application ne comporte ni système de compte, ni publicités, ni analyse d\'utilisation, ni rapport d\'erreurs.</string>
+     <string name="privacy_language_accent_color_whether_a_custom_output_location_is_used_and_the_selected_folder_s_uri_and_display_name_are_stored_in_private_app_settings_you_man">La langue, la couleur d\'accent, l\'utilisation ou non d\'un emplacement de sortie personnalisé, ainsi que l\'URI et le nom d\'affichage du dossier sélectionné sont enregistrés dans les paramètres privés de l\'application. Vous gérez les fichiers source et les fichiers convertis dans le système de fichiers ; la suppression des données de l\'application n\'entraîne pas la suppression des fichiers présents dans les dossiers partagés.</string>
+@@ -386,3 +386,3 @@
+     <string name="text_rotation_label">Rotation</string>
+-    <string name="text_running_keep_awake_message">%1$s · Garder ZenConverter au premier plan tout en laissant l\'écran allumé</string>
++    <string name="text_running_keep_awake_message">%1$s · Garder Format Setu au premier plan tout en laissant l\'écran allumé</string>
+     <string name="text_super_resolution_summary">Agrandissement bilinéaire · Qualité d\'origine</string>
+@@ -496,3 +496,3 @@
+     <string name="ui_app_download">Télécharger depuis l\'application</string>
+-    <string name="ui_app_logo">Logo de ZenConverter</string>
++    <string name="ui_app_logo">Logo de Format Setu</string>
+     <string name="ui_app_version">Version</string>
+@@ -530,3 +530,3 @@
+     <string name="ui_default_output_location">Dossier par défaut</string>
+-    <string name="ui_default_output_note">Dossiers système / ZenConverter</string>
++    <string name="ui_default_output_note">Dossiers système / Format Setu</string>
+     <string name="ui_download_cancelled">Téléchargement annulé</string>
+@@ -611,5 +611,5 @@
+     <string name="ui_skip">Ignorer</string>
+-    <string name="ui_sponsor_intro">Soutenez ZenConverter pour aider le projet à rester maintenu, open source, gratuit et sans publicité.</string>
++    <string name="ui_sponsor_intro">Soutenez Format Setu pour aider le projet à rester maintenu, open source, gratuit et sans publicité.</string>
+     <string name="ui_sponsor_no_benefits">Soutenir ne donne accès à aucun service ni fonctionnalité supplémentaire.</string>
+-    <string name="ui_sponsor_title">Soutenir ZenConverter</string>
++    <string name="ui_sponsor_title">Soutenir Format Setu</string>
+     <string name="ui_stable_update_channel">Stable</string>
+diff --git a/app/src/main/res/values-v31/styles.xml b/app/src/main/res/values-v31/styles.xml
+index 964c800..5d5aedd 100644
+--- a/app/src/main/res/values-v31/styles.xml
++++ b/app/src/main/res/values-v31/styles.xml
+@@ -6,3 +6,3 @@
+         <item name="android:windowDrawsSystemBarBackgrounds">true</item>
+-        <item name="android:windowSplashScreenBackground">@android:color/white</item>
++        <item name="android:windowSplashScreenBackground">#FAF9F5</item>
+         <item name="android:windowSplashScreenAnimatedIcon">@drawable/zenconverter_launch</item>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 34158ab..0490412 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -1,3 +1,3 @@
+ <resources>
+-    <string name="app_name" translatable="false">ZenConverter</string>
++    <string name="app_name" translatable="false">Format Setu</string>
+     <string name="a11y_add_split_point">Add split point</string>
+@@ -82,3 +82,3 @@
+     <string name="help_subtitle_title">Subtitles and Lyrics</string>
+-    <string name="help_title">What ZenConverter can do</string>
++    <string name="help_title">What Format Setu can do</string>
+     <string name="help_video_body">Convert common video formats, AI 2× frame rate interpolation (Experimental), merge multiple videos, trim &amp; split segments, or extract audio tracks.</string>
+@@ -174,3 +174,3 @@
+     <string name="privacy_for_privacy_questions_use_the_current_contact_method_listed_on_the_project_or_distribution_page_do_not_attach_files_passwords_or_sensitive_metadata_to_a">For privacy questions, use the current contact method listed on the project or distribution page. Do not attach files, passwords, or sensitive metadata to a public report.</string>
+-    <string name="privacy_intro_zenconverter_processes_files_on_your_device_files">ZenConverter processes files on your device. Files you select, their contents, and PDF passwords are not uploaded to servers controlled by the developer. The app has no account system, ads, usage analytics, or crash reporting.</string>
++    <string name="privacy_intro_zenconverter_processes_files_on_your_device_files">Format Setu processes files on your device. Files you select, their contents, and PDF passwords are not uploaded to servers controlled by the developer. The app has no account system, ads, usage analytics, or crash reporting.</string>
+     <string name="privacy_language_accent_color_whether_a_custom_output_location_is_used_and_the_selected_folder_s_uri_and_display_name_are_stored_in_private_app_settings_you_man">Language, accent color, whether a custom output location is used, and the selected folder\'s URI and display name are stored in private app settings. You manage source files and converted results in the file system; clearing app data does not remove files in shared folders.</string>
+@@ -391,3 +391,3 @@
+     <string name="text_rotation_label">Rotate</string>
+-    <string name="text_running_keep_awake_message">%1$s · Keeping the screen on; keep ZenConverter in the foreground</string>
++    <string name="text_running_keep_awake_message">%1$s · Keeping the screen on; keep Format Setu in the foreground</string>
+     <string name="text_super_resolution_summary">Bilinear upscale · Original quality</string>
+@@ -502,3 +502,3 @@
+     <string name="ui_app_license" translatable="false">AGPL-3.0-or-later</string>
+-    <string name="ui_app_logo">ZenConverter logo</string>
++    <string name="ui_app_logo">Format Setu logo</string>
+     <string name="ui_app_version">Version</string>
+@@ -536,3 +536,3 @@
+     <string name="ui_default_output_location">Default folder</string>
+-    <string name="ui_default_output_note">System folders / ZenConverter</string>
++    <string name="ui_default_output_note">System folders / Format Setu</string>
+     <string name="ui_download_cancelled">Download cancelled</string>
+@@ -606,2 +606,4 @@
+     <string name="ui_quality">Quality</string>
++    <string name="ui_target_size">Target size</string>
++    <string name="ui_target_size_hint">Compress the output to at most this size. Type a number with KB or MB, for example 500 KB or 2 MB. Leave empty for no limit.</string>
+     <string name="ui_queue">Conversion tasks</string>
+@@ -617,5 +619,5 @@
+     <string name="ui_skip">Skip</string>
+-    <string name="ui_sponsor_intro">Sponsor to help ZenConverter stay maintained, open-source, free, and ad-free.</string>
++    <string name="ui_sponsor_intro">Sponsor to help Format Setu stay maintained, open-source, free, and ad-free.</string>
+     <string name="ui_sponsor_no_benefits">Sponsorship does not unlock any additional services or features.</string>
+-    <string name="ui_sponsor_title">Sponsor ZenConverter</string>
++    <string name="ui_sponsor_title">Sponsor Format Setu</string>
+     <string name="ui_stable_update_channel">Stable</string>
