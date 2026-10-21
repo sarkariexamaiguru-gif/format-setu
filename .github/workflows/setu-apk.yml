@@ -68,8 +68,8 @@ jobs:
           set -euo pipefail
           {
             echo "sdk.dir=${ANDROID_SDK_ROOT}"
-            echo "ZENCONVERTER_VERSION_NAME=2.2.0"
-            echo "ZENCONVERTER_VERSION_CODE=2002000"
+            echo "ZENCONVERTER_VERSION_NAME=2.3.0"
+            echo "ZENCONVERTER_VERSION_CODE=2003000"
             echo "RELEASE_STORE_FILE=setu-ci.jks"
             echo "RELEASE_STORE_PASSWORD=setuci"
             echo "RELEASE_KEY_ALIAS=formatsetu"
@@ -89,8 +89,8 @@ jobs:
           mkdir -p dist
           apk="$(find app/build/outputs/apk/release -type f -name '*.apk' | head -n 1)"
           test -n "${apk}"
-          cp "${apk}" dist/Format-Setu-2.2.0-arm64-v8a.apk
-          sha256sum dist/Format-Setu-2.2.0-arm64-v8a.apk
+          cp "${apk}" dist/Format-Setu-2.3.0-arm64-v8a.apk
+          sha256sum dist/Format-Setu-2.3.0-arm64-v8a.apk
           ls -lh dist
 
       - name: Publish APK to a release
@@ -102,12 +102,12 @@ jobs:
             gh release create format-setu-latest \
               --title "Format Setu - current build" \
               --notes "The newest signed Format Setu build. Install this one."
-          gh release upload format-setu-latest dist/Format-Setu-2.2.0-arm64-v8a.apk --clobber
+          gh release upload format-setu-latest dist/Format-Setu-2.3.0-arm64-v8a.apk --clobber
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: formatsetu-apk
-          path: dist/Format-Setu-2.2.0-arm64-v8a.apk
+          path: dist/Format-Setu-2.3.0-arm64-v8a.apk
           if-no-files-found: error
           retention-days: 14

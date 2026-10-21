@@ -972,10 +972,10 @@ index 025ef5a..04ee105 100644
      Woff2("WOFF2"),
 diff --git a/app/src/main/java/org/zenconverter/app/download/LinkDownloader.kt b/app/src/main/java/org/zenconverter/app/download/LinkDownloader.kt
 new file mode 100644
-index 0000000..4290d18
+index 0000000..5ed1b96
 --- /dev/null
 +++ b/app/src/main/java/org/zenconverter/app/download/LinkDownloader.kt
-@@ -0,0 +1,181 @@
+@@ -0,0 +1,193 @@
 +package org.zenconverter.app.download
 +
 +import android.content.ContentValues
@@ -1060,6 +1060,18 @@ index 0000000..4290d18
 +                val ffmpegClass = Class.forName("com.yausername.ffmpeg.FFmpeg")
 +                val instance = ffmpegClass.getMethod("getInstance").invoke(null)
 +                ffmpegClass.getMethod("init", Context::class.java).invoke(instance, appContext)
++            }
++            // yt-dlp is refreshed in place. The bundled snapshot goes stale quickly because
++            // YouTube keeps changing its player, and a stale extractor is the usual cause of
++            // an "unable to extract" failure. Resolved reflectively so a renamed API can
++            // never break the build.
++            runCatching {
++                val instance = YoutubeDL.getInstance()
++                val method = YoutubeDL::class.java.methods.firstOrNull { candidate ->
++                    candidate.name == "updateYoutubeDL" && candidate.parameterTypes.size >= 2
++                } ?: return@runCatching
++                val channel = method.parameterTypes[1].enumConstants?.firstOrNull()
++                method.invoke(instance, appContext, channel)
 +            }
 +            initialized.set(true)
 +        }
@@ -1423,7 +1435,7 @@ index 23f94f9..a8d50db 100644
 +
      val pageSize: String
 diff --git a/app/src/main/java/org/zenconverter/app/ui/ZenConverterApp.kt b/app/src/main/java/org/zenconverter/app/ui/ZenConverterApp.kt
-index 49da19f..b602272 100644
+index 49da19f..6cf1fa4 100644
 --- a/app/src/main/java/org/zenconverter/app/ui/ZenConverterApp.kt
 +++ b/app/src/main/java/org/zenconverter/app/ui/ZenConverterApp.kt
 @@ -86,2 +86,3 @@ import androidx.compose.material.icons.rounded.Add
@@ -2214,6 +2226,21 @@ index 49da19f..b602272 100644
 -                    fontWeight = FontWeight.SemiBold,
 +                    fontWeight = FontWeight.Medium,
                      color = MaterialTheme.colorScheme.onBackground,
+@@ -2529,3 +3222,3 @@ private fun HeroAddButton(
+     val containerColor by animateColorAsState(
+-        targetValue = if (enabled) MaterialTheme.colorScheme.primary
++        targetValue = if (enabled) MaterialTheme.colorScheme.surfaceContainerHigh
+                       else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.10f),
+@@ -2535,3 +3228,3 @@ private fun HeroAddButton(
+     val borderColor by animateColorAsState(
+-        targetValue = if (enabled) MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)
++        targetValue = if (enabled) MaterialTheme.colorScheme.outline.copy(alpha = 0.9f)
+                       else MaterialTheme.colorScheme.outline.copy(alpha = 0.6f),
+@@ -2541,3 +3234,3 @@ private fun HeroAddButton(
+     val iconTint by animateColorAsState(
+-        targetValue = if (enabled) MaterialTheme.colorScheme.onPrimary
++        targetValue = if (enabled) MaterialTheme.colorScheme.onSurface
+                       else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.32f),
 @@ -2637,3 +3330,4 @@ private fun ImportSourceSheet(
      onPickFolder: () -> Unit,
 -    onPickFiles: () -> Unit
@@ -3571,7 +3598,7 @@ index 964c800..5d5aedd 100644
 +        <item name="android:windowSplashScreenBackground">#FAF9F5</item>
          <item name="android:windowSplashScreenAnimatedIcon">@drawable/zenconverter_launch</item>
 diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
-index 34158ab..0490412 100644
+index 34158ab..da4bfbf 100644
 --- a/app/src/main/res/values/strings.xml
 +++ b/app/src/main/res/values/strings.xml
 @@ -1,3 +1,3 @@
@@ -3594,6 +3621,15 @@ index 34158ab..0490412 100644
 -    <string name="text_running_keep_awake_message">%1$s · Keeping the screen on; keep ZenConverter in the foreground</string>
 +    <string name="text_running_keep_awake_message">%1$s · Keeping the screen on; keep Format Setu in the foreground</string>
      <string name="text_super_resolution_summary">Bilinear upscale · Original quality</string>
+@@ -494,5 +494,5 @@
+     <string name="ui_accent_color">Accent color</string>
+-    <string name="ui_add_files">Add files</string>
+-    <string name="ui_add_files_note">Choose files first, then set targets and options in the task list.</string>
+-    <string name="ui_add_files_title">Add files</string>
++    <string name="ui_add_files">Add photos, music, video or documents</string>
++    <string name="ui_add_files_note">Images, audio, video, PDFs and Office documents - converted on your device, nothing uploaded.</string>
++    <string name="ui_add_files_title">Add photos, music, video or PDFs</string>
+     <string name="ui_add_to_merge">Add to merge</string>
 @@ -502,3 +502,3 @@
      <string name="ui_app_license" translatable="false">AGPL-3.0-or-later</string>
 -    <string name="ui_app_logo">ZenConverter logo</string>
